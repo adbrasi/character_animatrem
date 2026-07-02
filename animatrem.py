@@ -2779,19 +2779,31 @@ def _setup_hf(cfg: TrainingConfig) -> tuple[bool, str]:
         api = HfApi()
         api.create_repo(repo_id, repo_type="model", private=private,
                         exist_ok=True)
-        # If the repo already existed, make its visibility match (so setting
-        # ANIMATREM_HF_PRIVATE=0 flips a full private repo to public → uploads
-        # work again on the generous public storage).
-        try:
-            api.update_repo_visibility(repo_id=repo_id, private=private,
-                                       repo_type="model")
-        except Exception:
-            pass
-        success(f"Repo HF: https://huggingface.co/{repo_id} "
-                f"({'privado' if private else 'público'})")
-        if private:
-            info("Dica: se o storage privado estiver cheio, rode com "
-                 "ANIMATREM_HF_PRIVATE=0 (repo público).")
+        # create_repo does NOT change an already-existing repo's visibility, so
+        # flip it explicitly. huggingface_hub renamed the API: newer versions
+        # use update_repo_settings(private=...), older use
+        # update_repo_visibility(...). Try both so a previously-private repo
+        # actually becomes public (else uploads keep hitting the private quota).
+        flipped = False
+        for attempt in (
+            lambda: api.update_repo_settings(repo_id=repo_id, private=private,
+                                             repo_type="model"),
+            lambda: api.update_repo_visibility(repo_id=repo_id, private=private,
+                                               repo_type="model"),
+        ):
+            try:
+                attempt()
+                flipped = True
+                break
+            except Exception:
+                continue
+        vis = "privado" if private else "público"
+        if flipped or not private:
+            success(f"Repo HF: https://huggingface.co/{repo_id} ({vis})")
+        else:
+            success(f"Repo HF: https://huggingface.co/{repo_id}")
+            warn(f"Não consegui forçar a visibilidade para {vis} "
+                 f"(mude manualmente em Settings do repo se precisar).")
         return True, repo_id
     except Exception as e:
         warn(f"Não consegui criar repo HF ({repo_id}): {e}")
@@ -3213,14 +3225,16 @@ def main() -> None:
     need_caption = (not advanced) and bool(getattr(cfg, "groups", []))
 
     # Caption first (so the summary shows real caption counts), then TOMLs.
-    if not skip_to_train and need_caption:
-        phase_caption(cfg, env)
+    if need_caption:
+        phase_caption(cfg, env)  # skips already-captioned groups
 
     phase5_summary(cfg, env, skip_confirm=skip_to_train)
 
-    if not skip_to_train:
-        phase6_check_captions(cfg)
-        phase7_write_tomls(cfg)
+    # ALWAYS (re)generate the TOMLs from the current cfg + current code, even on
+    # "train now" resume — otherwise a stale config.toml from an older version
+    # (e.g. epoch-based saving) would be reused and you'd get old behavior.
+    phase6_check_captions(cfg)
+    phase7_write_tomls(cfg)
 
     # HF upload: auto (private) in default mode; asked in --advanced.
     if advanced:
