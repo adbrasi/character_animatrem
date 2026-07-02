@@ -1,0 +1,24 @@
+{
+  "display_name": "anima-character-outfit",
+  "description": "Anima character LoRA com outfit específico — trigger_character é o sujeito (no início), e a roupa é escrita APENAS como trigger_outfit, sem descrição visual (cor/tecido/corte). Mantém o formato híbrido tags+prosa do anima-character para pose/cena/luz. Aceita uma instrução custom por dataset.",
+  "variables": [
+    {
+      "name": "trigger_character",
+      "prompt": "Character trigger name (e.g. aria, naruto_uzumaki) — placed at the START of every caption as the subject",
+      "required": true,
+      "default": ""
+    },
+    {
+      "name": "trigger_outfit",
+      "prompt": "Outfit trigger name (e.g. aria_beach, clown_suit) — written literally where clothing is mentioned, with NO visual description",
+      "required": true,
+      "default": ""
+    },
+    {
+      "name": "custom_instruction",
+      "prompt": "Optional operator instruction for the LLM on this specific outfit/dataset (leave empty to skip)",
+      "required": false,
+      "default": ""
+    }
+  ]
+}
