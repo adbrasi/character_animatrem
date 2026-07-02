@@ -1,7 +1,27 @@
 # character_animatrem — Design Spec
 
 **Date:** 2026-07-02
-**Status:** approved direction ("pode avançar na criação"); training-engine details pending upstream verification.
+**Status:** IMPLEMENTED (v1). Direction approved ("pode avançar na criação").
+
+### Implementation notes / deltas from initial design
+- **Base model changed by user:** `anima-base-v1.0.safetensors` (not preview3).
+- **Upstream verified:** diffusion-pipe still compatible — `model.type='anima'`
+  (dispatches to CosmosPredict2), launch `deepspeed … train.py --deepspeed
+  --config`, resume `--resume_from_checkpoint`+`--reset_dataloader`. New guard:
+  must NOT emit `alpha` in `[adapter]` (we don't).
+- **Caption LLM:** `google/gemini-2.5-flash` on OpenRouter (strict JSON schema
+  supported). Captioner run as `--taggers pixai,grok --grok_provider openrouter
+  --grok_model <gemini>`; PixAI runs first and feeds the LLM as context.
+- **Input flow finalized:** ONE input source; the tool detects subfolders
+  (descends single-wrapper dirs) → one group per subfolder; per-folder
+  "is it a specific outfit?" + trigger + free-text `custom_instruction`. No
+  "add another outfit" loop.
+- Built by evolving `research_anima_train/anima_training_diffusion_pipe.py` into
+  `animatrem.py` (new wizard/caption/HF-card phases; legacy path kept behind
+  `--advanced`). Model card + metadata in `hf_modelcard.py`.
+- Verified so far (no GPU): `py_compile`, and unit smoke tests for `_slugify`,
+  `detect_groups` (single / multi-outfit / nested-flatten), balanced
+  `num_repeats` schedule, multi-`[[directory]]` TOML, and model-card render.
 
 ## 1. Goal
 
