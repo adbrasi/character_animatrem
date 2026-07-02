@@ -1723,15 +1723,15 @@ def _compute_schedule(cfg: TrainingConfig, recipe: dict, eff_batch: int) -> None
     passes_per_epoch_per_img = cfg.num_repeats * n_res
     cfg.epochs = max(1, target_exposures // max(1, passes_per_epoch_per_img))
 
-    # Save cadence:
-    #   - LoRA (rank > 0): every 1 epoch. LoRA artifacts are ~50-100 MB; saving
-    #     often is cheap and lets you cherry-pick the best checkpoint. With 1
-    #     epoch cadence and 120 epochs the user gets 120 testable LoRAs (~12 GB
-    #     total disk) — fits comfortably even on 130 GB workstations.
-    #   - FFT (rank == 0): the whole 2B model is saved each time (~4 GB).
-    #     Cap at ~5 saves total to stay under disk budget.
+    # Save cadence — aim for a HANDFUL of checkpoints to cherry-pick from, NOT
+    # one per epoch. Anima LoRAs are ~140 MB each, so 60 epochs × 1/epoch = ~8 GB
+    # of checkpoints and 60 HF uploads — wasteful and floods small disks / HF
+    # storage quotas. Target ~TARGET_SAVES checkpoints spread across the run.
+    #   - LoRA (rank > 0): every epochs/8 (≈8 saves).
+    #   - FFT (rank == 0): whole 2B model each time (~4 GB) → cap at ~5.
+    TARGET_SAVES = 8
     if cfg.rank > 0:
-        cfg.save_every_n_epochs = 1
+        cfg.save_every_n_epochs = max(1, round(cfg.epochs / TARGET_SAVES))
     else:
         cfg.save_every_n_epochs = max(1, cfg.epochs // 5)
     # Eval cadence: tdrussell oficial = 5; cap at 5 regardless of total epochs.
@@ -2261,6 +2261,12 @@ def _toml_array(values: list) -> str:
 def phase7_write_tomls(cfg: TrainingConfig) -> None:
     header("FASE 7 — Gerando dataset.toml e config.toml")
 
+    # Safety clamp (also fixes resumed projects saved with an old 1/epoch
+    # cadence): never emit more than ~12 LoRA checkpoints across the run.
+    if cfg.rank > 0 and cfg.epochs > 0:
+        if cfg.epochs // max(1, cfg.save_every_n_epochs) > 12:
+            cfg.save_every_n_epochs = max(1, round(cfg.epochs / 8))
+
     dataset_entries = get_dataset_entries(cfg)
 
     # ── dataset.toml ───────────────────────────────────────────────
@@ -2429,7 +2435,13 @@ def phase7_write_tomls(cfg: TrainingConfig) -> None:
 # Phase 8 — Train
 # ═══════════════════════════════════════════════════════════════════════════
 
+_HF_UPLOAD_DISABLED = False  # set True after a storage-limit/permission failure
+
+
 def _hf_upload_file(local_path: str, repo_path: str, repo_id: str) -> bool:
+    global _HF_UPLOAD_DISABLED
+    if _HF_UPLOAD_DISABLED:
+        return False
     try:
         from huggingface_hub import HfApi
         HfApi().upload_file(path_or_fileobj=local_path, path_in_repo=repo_path,
@@ -2437,7 +2449,16 @@ def _hf_upload_file(local_path: str, repo_path: str, repo_id: str) -> bool:
         success(f"Upload: {repo_path} → {repo_id}")
         return True
     except Exception as e:
-        warn(f"Upload falhou: {e}")
+        msg = str(e).lower()
+        if ("storage limit" in msg or "403" in msg or "quota" in msg
+                or "forbidden" in msg):
+            _HF_UPLOAD_DISABLED = True   # stop retrying every checkpoint
+            warn("Upload HF desativado: limite de storage/permissão do HuggingFace.")
+            console.print("        [dim]Torne o repo público (storage público é "
+                          "generoso) ou libere espaço. Os .safetensors continuam "
+                          "salvos localmente em outputs/.[/dim]")
+        else:
+            warn(f"Upload falhou: {e}")
         return False
 
 
@@ -2660,10 +2681,22 @@ def _setup_hf(cfg: TrainingConfig) -> tuple[bool, str]:
     cfg.hf_private = private
     try:
         from huggingface_hub import HfApi
-        HfApi().create_repo(repo_id, repo_type="model", private=private,
-                            exist_ok=True)
+        api = HfApi()
+        api.create_repo(repo_id, repo_type="model", private=private,
+                        exist_ok=True)
+        # If the repo already existed, make its visibility match (so setting
+        # ANIMATREM_HF_PRIVATE=0 flips a full private repo to public → uploads
+        # work again on the generous public storage).
+        try:
+            api.update_repo_visibility(repo_id=repo_id, private=private,
+                                       repo_type="model")
+        except Exception:
+            pass
         success(f"Repo HF: https://huggingface.co/{repo_id} "
                 f"({'privado' if private else 'público'})")
+        if private:
+            info("Dica: se o storage privado estiver cheio, rode com "
+                 "ANIMATREM_HF_PRIVATE=0 (repo público).")
         return True, repo_id
     except Exception as e:
         warn(f"Não consegui criar repo HF ({repo_id}): {e}")
@@ -2745,7 +2778,7 @@ def phase8_train(cfg: TrainingConfig, hf_upload: bool, repo_id: str
     script.chmod(0o755)
     info(f"Comando equivalente: {script}")
 
-    success("Iniciando treinamento...")
+    success("Iniciando treinamento…  [dim](Ctrl+C cancela; Ctrl+C 2× força)[/dim]")
     train_proc = subprocess.Popen(
         cmd, cwd=str(DIFFUSION_PIPE_DIR), env=env, start_new_session=True,
     )
@@ -2770,23 +2803,49 @@ def phase8_train(cfg: TrainingConfig, hf_upload: bool, repo_id: str
         hf_thread.start()
         threads.append(hf_thread)
 
+    # Robust cancellation. deepspeed runs in its OWN session (start_new_session),
+    # so the terminal's Ctrl+C reaches only this parent — not the child. We must
+    # catch SIGINT here and forward it to the child's process group ourselves:
+    #   1st Ctrl+C → SIGTERM the whole group (graceful stop).
+    #   2nd Ctrl+C → SIGKILL the group and hard-exit (guaranteed stop).
+    # Without this, Ctrl+C looked ignored and training kept running.
+    interrupts = {"n": 0}
+
+    def _on_sigint(signum, frame):
+        interrupts["n"] += 1
+        try:
+            pgid = os.getpgid(train_proc.pid)
+        except OSError:
+            pgid = None
+        if interrupts["n"] == 1:
+            console.print("\n[bold dark_orange3]⚠ Cancelando treino (SIGTERM)… "
+                          "Ctrl+C de novo para forçar (SIGKILL).[/bold dark_orange3]")
+            sig = signal.SIGTERM
+        else:
+            console.print("\n[bold red1]✘ Forçando encerramento (SIGKILL).[/bold red1]")
+            sig = signal.SIGKILL
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+            except OSError:
+                pass
+        try:
+            train_proc.send_signal(sig)
+        except Exception:
+            pass
+        if interrupts["n"] >= 2:
+            os._exit(130)
+
+    old_handler = signal.signal(signal.SIGINT, _on_sigint)
     try:
         train_proc.wait()
-    except KeyboardInterrupt:
-        warn("Interrompido — encerrando...")
-        try:
-            os.killpg(os.getpgid(train_proc.pid), signal.SIGTERM)
-            train_proc.wait(timeout=20)
-        except (subprocess.TimeoutExpired, OSError):
-            try:
-                os.killpg(os.getpgid(train_proc.pid), signal.SIGKILL)
-            except OSError:
-                train_proc.kill()
-            train_proc.wait()
-        raise
     finally:
+        signal.signal(signal.SIGINT, old_handler)
         for t in threads:
-            t.join(timeout=120)
+            t.join(timeout=10)
+
+    if interrupts["n"] > 0:
+        warn("Treino cancelado pelo usuário. Checkpoints já salvos ficam em outputs/.")
 
     if train_proc.returncode != 0:
         error(f"Treinamento terminou com código {train_proc.returncode}")
