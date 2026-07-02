@@ -495,9 +495,14 @@ class TrainingConfig:
     cache_shuffle_num:  int = 0  # 0 = no shuffle (recommended for Anima NL captions)
     shuffle_tags:       bool = False
 
-    # Save / eval
-    save_every_n_epochs:    int = 5
-    eval_every_n_epochs:    int = 5
+    # Save / eval — native diffusion-pipe cadence. The character path saves by
+    # STEPS (save_every_n_steps = total_steps // ~10); epoch-based is kept for
+    # the --advanced/FFT path. total_steps is informational.
+    save_every_n_epochs:    int = 0
+    save_every_n_steps:     int = 0
+    eval_every_n_epochs:    int = 0
+    eval_every_n_steps:     int = 0
+    total_steps:            int = 0
     eval_before_first_step: bool = True
     checkpoint_every_n_minutes: int = 60
 
@@ -1599,31 +1604,45 @@ def _summarize_groups(cfg: "TrainingConfig") -> None:
     console.print()
 
 
+SCHED_NUM_REPEATS = 10       # repeat each image 10× per epoch (same all groups)
+SCHED_TARGET_CHECKPOINTS = 10  # ~10 model saves across the run (by steps)
+
+
 def _compute_group_schedule(cfg: "TrainingConfig", recipe: dict,
                             eff_batch: int) -> None:
-    """Set per-group balanced num_repeats + global epochs.
+    """Simple, native diffusion-pipe schedule (no reinvented cadence):
 
-    - Small groups get more repeats so a 25-img outfit isn't drowned by a
-      200-img base (bounded by recipe max_repeats).
-    - Epochs are derived from the LARGEST group so the base character hits the
-      recipe's exposures/img target; smaller outfits get proportionally more
-      per-image exposure (good for outfit consistency).
+      num_repeats = SCHED_NUM_REPEATS for every group;
+      epochs derived so exposures/image = epochs × num_repeats × n_res hits the
+      recipe target (~660, the validated sweet spot);
+      total_steps = epochs × (Σ images × num_repeats × n_res) / eff_batch;
+      save the model every  total_steps // SCHED_TARGET_CHECKPOINTS  STEPS
+      (diffusion-pipe's native `save_every_n_steps`, dirs named step<N>/).
+
+    This gives ~SCHED_TARGET_CHECKPOINTS checkpoints to pick the best from,
+    regardless of dataset size, using the engine's own saving — no per-epoch
+    flooding.
     """
-    counts = [max(1, int(g.get("image_count", 0))) for g in cfg.groups]
-    max_count = max(counts) if counts else 1
-    for g, c in zip(cfg.groups, counts):
-        g["num_repeats"] = max(recipe["min_repeats"],
-                               min(recipe["max_repeats"], round(max_count / c)))
-    # Reference the largest group for epoch/global-repeat computation.
-    saved = cfg.image_count
-    cfg.image_count = max_count
-    _compute_schedule(cfg, recipe, eff_batch)  # sets cfg.num_repeats + cfg.epochs
-    global_mult = max(1, cfg.num_repeats)
-    cfg.image_count = saved
-    if global_mult > 1:  # tiny-dataset bump applies to every group
-        for g in cfg.groups:
-            g["num_repeats"] *= global_mult
-    cfg.num_repeats = 1  # representative base; real repeats live per-group
+    n_res = max(1, len(cfg.resolutions))
+
+    cfg.num_repeats = SCHED_NUM_REPEATS
+    for g in cfg.groups:
+        g["num_repeats"] = SCHED_NUM_REPEATS
+
+    target_exposures = recipe["exposures_per_image"]
+    cfg.exposures_per_image = target_exposures
+    cfg.epochs = max(1, round(target_exposures / (SCHED_NUM_REPEATS * n_res)))
+
+    total_images = sum(max(0, int(g.get("image_count", 0))) for g in cfg.groups)
+    samples_per_epoch = max(1, total_images * SCHED_NUM_REPEATS * n_res)
+    steps_per_epoch = max(1, samples_per_epoch // max(1, eff_batch))
+    cfg.total_steps = steps_per_epoch * cfg.epochs
+
+    # Native step-based saving (train.py names these step<N>/).
+    cfg.save_every_n_steps = max(1, cfg.total_steps // SCHED_TARGET_CHECKPOINTS)
+    cfg.eval_every_n_steps = cfg.save_every_n_steps
+    cfg.save_every_n_epochs = 0   # step cadence drives this path
+    cfg.eval_every_n_epochs = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2070,8 +2089,10 @@ def phase_wizard(cfg: TrainingConfig, env: dict, transformer_path: Path,
     eff_batch = eff_micro * cfg.gradient_accumulation_steps
 
     _compute_group_schedule(cfg, recipe, eff_batch)
-    reps = ", ".join(f"{Path(g['path']).name}×{g['num_repeats']}" for g in cfg.groups)
-    info(f"Cronograma: epochs={cfg.epochs} · repeats por grupo: {reps} · res={cfg.resolutions}")
+    info(f"Cronograma: num_repeats={cfg.num_repeats} · epochs={cfg.epochs} · "
+         f"~{cfg.total_steps} steps · salva a cada {cfg.save_every_n_steps} steps "
+         f"(~{max(1, cfg.total_steps // cfg.save_every_n_steps)} checkpoints) · "
+         f"res={cfg.resolutions}")
 
     cfg.save()  # persist full wizard result → resume skips all of the above
     return cfg
@@ -2099,7 +2120,9 @@ def phase5_summary(cfg: TrainingConfig, env: dict, skip_confirm: bool = False) -
     eff_micro = cfg.micro_batch_size if isinstance(cfg.micro_batch_size, int) \
         else max(b for _, b in cfg.micro_batch_size)
     eff_batch = eff_micro * cfg.gradient_accumulation_steps
-    total_steps_est = (cfg.image_count * cfg.num_repeats * cfg.epochs) // max(1, eff_batch)
+    total_steps_est = cfg.total_steps if cfg.total_steps > 0 else (
+        (cfg.image_count * cfg.num_repeats * max(1, len(cfg.resolutions))
+         * cfg.epochs) // max(1, eff_batch))
 
     t1 = Table(title="Dataset", show_header=False, box=None, padding=(0, 2))
     t1.add_column(style="bold"); t1.add_column()
@@ -2127,7 +2150,13 @@ def phase5_summary(cfg: TrainingConfig, env: dict, skip_confirm: bool = False) -
     t2.add_row("micro_batch",        str(cfg.micro_batch_size))
     t2.add_row("grad_accum",         f"{cfg.gradient_accumulation_steps} (efetivo ~{eff_batch})")
     t2.add_row("Epochs × repeats",   f"{cfg.epochs} × {cfg.num_repeats}  (~{total_steps_est} steps)")
-    t2.add_row("Save / eval",        f"a cada {cfg.save_every_n_epochs} / {cfg.eval_every_n_epochs} epochs")
+    if cfg.save_every_n_steps and cfg.save_every_n_steps > 0:
+        n_ckpts = max(1, total_steps_est // cfg.save_every_n_steps)
+        t2.add_row("Save (native)", f"a cada {cfg.save_every_n_steps} steps "
+                                    f"(~{n_ckpts} checkpoints)")
+    else:
+        t2.add_row("Save / eval", f"a cada {cfg.save_every_n_epochs} / "
+                                  f"{cfg.eval_every_n_epochs} epochs")
     t2.add_row("Activation chkpt",   "ON" if cfg.activation_checkpointing else "OFF")
     t2.add_row("blocks_to_swap",     str(cfg.blocks_to_swap))
     t2.add_row("FP8 transformer",    "yes" if cfg.use_fp8 else "no (bf16)")
@@ -2264,12 +2293,29 @@ def _toml_array(values: list) -> str:
 def phase7_write_tomls(cfg: TrainingConfig) -> None:
     header("FASE 7 — Gerando dataset.toml e config.toml")
 
-    # Safety clamp (also fixes resumed projects saved with an old 1/epoch
-    # cadence): never emit more than ~14 LoRA checkpoints across the run.
-    if cfg.rank > 0 and cfg.epochs > 0:
-        if cfg.epochs // max(1, cfg.save_every_n_epochs) > 14:
-            cfg.save_every_n_epochs = max(1, round(cfg.epochs / 11))
-        cfg.eval_every_n_epochs = cfg.save_every_n_epochs
+    # Backfill native step-based saving for resumed animatrem projects (saved
+    # before step cadence existed) so they ALSO save ~10× total, not every
+    # epoch. Only for grouped (animatrem) projects — the --advanced path keeps
+    # whatever epoch cadence it set.
+    if cfg.rank > 0 and cfg.groups and cfg.save_every_n_steps <= 0 and cfg.epochs > 0:
+        n_res = max(1, len(cfg.resolutions))
+        if isinstance(cfg.micro_batch_size, int):
+            eff_micro = cfg.micro_batch_size
+        elif cfg.micro_batch_size:
+            eff_micro = min(b for _, b in cfg.micro_batch_size)
+        else:
+            eff_micro = 1
+        eff_batch = max(1, eff_micro * max(1, cfg.gradient_accumulation_steps))
+        if cfg.groups:
+            samples_per_epoch = sum(
+                int(g.get("image_count", 0)) * int(g.get("num_repeats", 1) or 1)
+                for g in cfg.groups) * n_res
+        else:
+            samples_per_epoch = total_image_count(cfg) * max(1, cfg.num_repeats) * n_res
+        steps_per_epoch = max(1, samples_per_epoch // eff_batch)
+        cfg.total_steps = steps_per_epoch * max(1, cfg.epochs)
+        cfg.save_every_n_steps = max(1, cfg.total_steps // SCHED_TARGET_CHECKPOINTS)
+        cfg.eval_every_n_steps = cfg.save_every_n_steps
 
     dataset_entries = get_dataset_entries(cfg)
 
@@ -2350,14 +2396,25 @@ def phase7_write_tomls(cfg: TrainingConfig) -> None:
     elif cfg.loss == "smooth_l1_beta" and cfg.pseudo_huber_c is not None:
         cfg_lines.append(f"smooth_l1_beta               = {cfg.pseudo_huber_c}")
 
+    # Eval + model-save cadence. Prefer native STEP-based saving (train.py
+    # names these step<N>/); fall back to epoch cadence only if steps unset
+    # (--advanced / FFT). diffusion-pipe requires at least one save_every_*.
+    cfg_lines.append("")
+    if cfg.eval_every_n_steps and cfg.eval_every_n_steps > 0:
+        cfg_lines.append(f"eval_every_n_steps               = {cfg.eval_every_n_steps}")
+    else:
+        cfg_lines.append(f"eval_every_n_epochs              = {max(1, cfg.eval_every_n_epochs)}")
     cfg_lines += [
-        "",
-        f"eval_every_n_epochs              = {cfg.eval_every_n_epochs}",
         f"eval_before_first_step           = {str(cfg.eval_before_first_step).lower()}",
         f"eval_micro_batch_size_per_gpu    = 1",
         f"eval_gradient_accumulation_steps = 1",
         "",
-        f"save_every_n_epochs              = {cfg.save_every_n_epochs}",
+    ]
+    if cfg.save_every_n_steps and cfg.save_every_n_steps > 0:
+        cfg_lines.append(f"save_every_n_steps               = {cfg.save_every_n_steps}")
+    else:
+        cfg_lines.append(f"save_every_n_epochs              = {max(1, cfg.save_every_n_epochs)}")
+    cfg_lines += [
         f"checkpoint_every_n_minutes       = {cfg.checkpoint_every_n_minutes}",
         f"activation_checkpointing         = {str(cfg.activation_checkpointing).lower()}",
         f"partition_method                 = 'parameters'",
@@ -2480,9 +2537,30 @@ def _wait_for_stable(p: Path, checks: int = 4, interval: int = 5) -> bool:
     return False
 
 
+_CKPT_DIR_RE = re.compile(r"^(epoch|step)(\d+)$")
+
+
+def _ckpt_dir_info(d: Path) -> Optional[tuple[str, int]]:
+    """Return (tag, ordinal) for a diffusion-pipe model-save dir. train.py names
+    them `epoch{N}` (epoch cadence) or `step{N}` (step cadence) — train.py:946/952.
+    Returns e.g. ('step600', 600) or ('epoch5', 5); None if not a save dir."""
+    m = _CKPT_DIR_RE.match(d.name)
+    return (f"{m.group(1)}{m.group(2)}", int(m.group(2))) if m else None
+
+
 def _epoch_num_from_dir(d: Path) -> Optional[int]:
-    m = re.search(r"epoch(\d+)", d.name)
-    return int(m.group(1)) if m else None
+    info = _ckpt_dir_info(d)
+    return info[1] if info else None
+
+
+def _list_ckpt_dirs(output_dir: Path) -> list[Path]:
+    """All model-save dirs (epoch*/ or step*/) under output_dir, sorted by
+    ordinal. A single run uses one cadence, so ordinal sort = training order."""
+    if not output_dir.exists():
+        return []
+    cands = list(output_dir.rglob("epoch*")) + list(output_dir.rglob("step*"))
+    dirs = {d for d in cands if d.is_dir() and _ckpt_dir_info(d)}
+    return sorted(dirs, key=lambda d: _ckpt_dir_info(d)[1])  # type: ignore[index]
 
 
 def _make_friendly_safetensors_copy(epoch_dir: Path, project_name: str) -> Optional[Path]:
@@ -2491,9 +2569,10 @@ def _make_friendly_safetensors_copy(epoch_dir: Path, project_name: str) -> Optio
     the canonical name (it's referenced by `latest` tags etc.), but we CAN
     drop a friendly-named hardlink/copy alongside, and keep that one in sync
     with HF uploads. Returns the friendly path if created/refreshed."""
-    epoch_num = _epoch_num_from_dir(epoch_dir)
-    if epoch_num is None:
+    info = _ckpt_dir_info(epoch_dir)
+    if info is None:
         return None
+    tag, _ = info
     canonical: Optional[Path] = None
     for cand_name in ("adapter_model.safetensors", "model.safetensors"):
         cand = epoch_dir / cand_name
@@ -2502,7 +2581,7 @@ def _make_friendly_safetensors_copy(epoch_dir: Path, project_name: str) -> Optio
             break
     if canonical is None or not _wait_for_stable(canonical):
         return None
-    friendly = epoch_dir / f"{project_name}_epoch{epoch_num}.safetensors"
+    friendly = epoch_dir / f"{project_name}_{tag}.safetensors"
     if friendly.exists() and friendly.stat().st_size == canonical.stat().st_size:
         return friendly
     try:
@@ -2528,11 +2607,7 @@ def _rename_watcher(train_proc: subprocess.Popen, output_dir: Path,
     seen: set[str] = set()
     while train_proc.poll() is None:
         time.sleep(30)
-        if not output_dir.exists():
-            continue
-        for epoch_dir in output_dir.rglob("epoch*"):
-            if not epoch_dir.is_dir():
-                continue
+        for epoch_dir in _list_ckpt_dirs(output_dir):
             key = str(epoch_dir.resolve())
             friendly = _make_friendly_safetensors_copy(epoch_dir, project_name)
             if friendly and key not in seen:
@@ -2543,16 +2618,14 @@ def _rename_watcher(train_proc: subprocess.Popen, output_dir: Path,
                         on_friendly(friendly)
                     except Exception:  # never let the watcher crash
                         pass
-    # Final pass after training ends — catch the very last epoch.
-    if output_dir.exists():
-        for epoch_dir in output_dir.rglob("epoch*"):
-            if epoch_dir.is_dir():
-                friendly = _make_friendly_safetensors_copy(epoch_dir, project_name)
-                if friendly and on_friendly is not None:
-                    try:
-                        on_friendly(friendly)
-                    except Exception:
-                        pass
+    # Final pass after training ends — catch the very last checkpoint.
+    for epoch_dir in _list_ckpt_dirs(output_dir):
+        friendly = _make_friendly_safetensors_copy(epoch_dir, project_name)
+        if friendly and on_friendly is not None:
+            try:
+                on_friendly(friendly)
+            except Exception:
+                pass
 
 
 def _hf_monitor(train_proc: subprocess.Popen, output_dir: Path,
@@ -2874,20 +2947,18 @@ def phase9_post_training(cfg: TrainingConfig, hf_upload: bool, repo_id: str,
     # rename watcher already created `<project>_epochN.safetensors` inside
     # each. Sweep one more time to catch the final epoch in case the watcher
     # didn't fire (process exited too fast).
-    epoch_dirs = sorted(
-        [d for d in out_dir.rglob("epoch*") if d.is_dir()],
-        key=lambda d: _epoch_num_from_dir(d) or 0,
-    )
+    epoch_dirs = _list_ckpt_dirs(out_dir)
     if not epoch_dirs:
-        warn("Nenhuma pasta epoch* encontrada.")
+        warn("Nenhuma pasta epoch*/step* encontrada.")
         return
     for d in epoch_dirs:
         _make_friendly_safetensors_copy(d, cfg.project_name)
 
     latest = epoch_dirs[-1]
-    success(f"Último epoch salvo: {latest}")
+    success(f"Último checkpoint salvo: {latest}")
 
-    friendly_pattern = re.compile(rf"^{re.escape(cfg.project_name)}_epoch\d+\.safetensors$")
+    friendly_pattern = re.compile(
+        rf"^{re.escape(cfg.project_name)}_(epoch|step)\d+\.safetensors$")
     friendly_in_latest = next(
         (p for p in latest.iterdir() if p.is_file() and friendly_pattern.match(p.name)),
         None,
