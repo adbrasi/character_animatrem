@@ -18,8 +18,19 @@ from pathlib import Path
 from typing import Any
 
 
+def _clean(text: str) -> str:
+    """Repair lone surrogates (from ASCII+surrogateescape stdin) so utf-8 writes
+    never crash. Idempotent for valid strings."""
+    if not isinstance(text, str):
+        return text
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
 def _truncate(text: str, limit: int = 500) -> str:
-    text = " ".join((text or "").split())
+    text = " ".join(_clean(text or "").split())
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
@@ -236,7 +247,7 @@ def write_model_card_files(cfg: Any, out_dir: Path, repo_id: str, env: dict, *,
 
     card_path = out_dir / "README.md"
     meta_path = out_dir / "animatrem_metadata.json"
-    card_path.write_text(card, encoding="utf-8")
-    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
+    card_path.write_text(_clean(card), encoding="utf-8")
+    meta_path.write_text(_clean(json.dumps(meta, indent=2, ensure_ascii=False)),
                          encoding="utf-8")
     return card_path, meta_path

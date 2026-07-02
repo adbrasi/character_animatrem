@@ -83,6 +83,31 @@ from rich.progress import (
 
 console = Console()
 
+# Force UTF-8 stdio even on containers with a C/POSIX locale (RunPod slim),
+# otherwise typed accented text is decoded as ASCII+surrogateescape and later
+# crashes json/utf-8 writes with "surrogates not allowed".
+for _std in (sys.stdin, sys.stdout, sys.stderr):
+    try:
+        _std.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
+def _clean_surrogates(obj):
+    """Recursively repair strings mangled by ASCII+surrogateescape stdin:
+    re-encode via surrogateescape to recover the original bytes, then decode as
+    UTF-8. Idempotent for already-valid strings; recursive over list/dict."""
+    if isinstance(obj, str):
+        try:
+            return obj.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return obj.encode("utf-8", "replace").decode("utf-8", "replace")
+    if isinstance(obj, list):
+        return [_clean_surrogates(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _clean_surrogates(v) for k, v in obj.items()}
+    return obj
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Constants
@@ -493,8 +518,9 @@ class TrainingConfig:
 
     def save(self) -> None:
         self.project_dir.mkdir(parents=True, exist_ok=True)
-        data = {k: v for k, v in self.__dict__.items()}
-        self._saved_config_path().write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        data = _clean_surrogates({k: v for k, v in self.__dict__.items()})
+        self._saved_config_path().write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     @classmethod
     def load(cls, project_name: str) -> Optional["TrainingConfig"]:
@@ -1537,7 +1563,7 @@ def _sample_captions(group_dir: Path, n: int = 3) -> list[str]:
     out: list[str] = []
     for txt in sorted(group_dir.glob("*.txt")):
         try:
-            content = txt.read_text(encoding="utf-8").strip()
+            content = txt.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             continue
         if content:
@@ -1545,6 +1571,18 @@ def _sample_captions(group_dir: Path, n: int = 3) -> list[str]:
         if len(out) >= n:
             break
     return out
+
+
+def _count_nonempty_captions(group_dir: Path) -> int:
+    """Count .txt files in a group that exist and are non-empty."""
+    total = 0
+    for txt in group_dir.glob("*.txt"):
+        try:
+            if txt.read_text(encoding="utf-8", errors="replace").strip():
+                total += 1
+        except OSError:
+            continue
+    return total
 
 
 def _summarize_groups(cfg: "TrainingConfig") -> None:
@@ -2118,6 +2156,7 @@ def phase_caption(cfg: TrainingConfig, env: dict) -> None:
         os.environ["OPENROUTER_API_KEY"] = key
 
     info(f"Modelo de caption: [bold]{CAPTION_MODEL}[/bold]  ·  tagger: PixAI")
+    recaption = "--recaption" in sys.argv
     console.print()
 
     for i, g in enumerate(cfg.groups, 1):
@@ -2129,8 +2168,18 @@ def phase_caption(cfg: TrainingConfig, env: dict) -> None:
         else:
             label = "personagem base"
         info(f"[{i}/{len(cfg.groups)}] {g['image_count']} imgs · {label} · {escape(gd.name)}")
+
+        # Skip groups already fully captioned (resume-friendly after a crash);
+        # override with --recaption.
+        nonempty = _count_nonempty_captions(gd)
+        if not recaption and g["image_count"] > 0 and nonempty >= g["image_count"]:
+            success(f"  já legendado ({nonempty} captions) — pulando "
+                    f"(use --recaption p/ refazer)")
+            g["caption_examples"] = _sample_captions(gd, 3)
+            continue
+
         _run_captioner_on_group(cfg, g)
-        n_caps = count_captions(gd)
+        n_caps = _count_nonempty_captions(gd)
         if n_caps == 0:
             warn(f"  Nenhuma caption gerada em '{escape(gd.name)}' — "
                  f"cheque OPENROUTER_API_KEY / HF_TOKEN / cota.")
