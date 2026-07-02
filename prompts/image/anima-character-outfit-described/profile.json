@@ -1,0 +1,24 @@
+{
+  "display_name": "anima-character-outfit-described",
+  "description": "Anima character + outfit, modo DESCRITO (flexível): personagem como sujeito, o trigger_outfit aparece como token para seleção, MAS a roupa é descrita normalmente (cor/tecido/corte). Use quando quiser editar/variar a roupa no inference. Aceita instrução custom.",
+  "variables": [
+    {
+      "name": "trigger_character",
+      "prompt": "Character trigger name (e.g. aria) — placed at the START as the subject",
+      "required": true,
+      "default": ""
+    },
+    {
+      "name": "trigger_outfit",
+      "prompt": "Outfit trigger name (e.g. aria_beach) — included as a token; the outfit IS also described",
+      "required": true,
+      "default": ""
+    },
+    {
+      "name": "custom_instruction",
+      "prompt": "Optional operator instruction for the LLM on this outfit/dataset (leave empty to skip)",
+      "required": false,
+      "default": ""
+    }
+  ]
+}

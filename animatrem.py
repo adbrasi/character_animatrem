@@ -148,8 +148,9 @@ CAPTION_MODEL = os.environ.get("ANIMATREM_CAPTION_MODEL", "google/gemini-2.5-fla
 
 # Prompt profiles used for captioning (resolved inside the captioner's
 # prompts/image/<profile>/ tree; the custom one is copied in at bootstrap).
-PROFILE_CHARACTER        = "anima-character"          # base group (no outfit)
-PROFILE_CHARACTER_OUTFIT = "anima-character-outfit"   # specific-outfit group
+PROFILE_CHARACTER          = "anima-character"          # base group (no outfit)
+PROFILE_CHARACTER_OUTFIT   = "anima-character-outfit"   # outfit, LOCKED (trigger-only)
+PROFILE_CHARACTER_OUTFIT_DESCRIBED = "anima-character-outfit-described"  # outfit, DESCRIBED
 
 # This repo's own directory (script + custom prompt profile live here).
 REPO_DIR           = Path(__file__).resolve().parent
@@ -435,6 +436,9 @@ class TrainingConfig:
     #    num_repeats, caption_examples}
     groups:             list = field(default_factory=list)
     hf_private:         bool = True
+    # Outfit caption mode: True = describe the outfit ONLY as its trigger
+    # (locked/consistent); False = also describe the clothing (flexible).
+    outfit_lock:        bool = True
 
     # Recipe (one of RECIPES keys)
     recipe:             str = "character"
@@ -1541,7 +1545,11 @@ def _run_captioner_on_group(cfg: "TrainingConfig", group: dict) -> None:
     next to each image (the caption LLM output)."""
     group_dir = Path(group["path"])
     is_outfit = bool(group.get("is_outfit"))
-    profile = PROFILE_CHARACTER_OUTFIT if is_outfit else PROFILE_CHARACTER
+    if is_outfit:
+        profile = (PROFILE_CHARACTER_OUTFIT if getattr(cfg, "outfit_lock", True)
+                   else PROFILE_CHARACTER_OUTFIT_DESCRIBED)
+    else:
+        profile = PROFILE_CHARACTER
     cmd = [
         sys.executable, str(CAPTIONER_SCRIPT), str(group_dir),
         "--taggers", "pixai,grok",
@@ -2060,6 +2068,15 @@ def phase_wizard(cfg: TrainingConfig, env: dict, transformer_path: Path,
     if multi:
         console.print(Rule(style="dim"))
         info(f"Detectei [bold]{len(group_dirs)}[/bold] pastas — vou perguntar sobre cada outfit.")
+        # Project-level outfit caption mode (asked once).
+        console.print("  [dim]Modo dos outfits:[/dim]")
+        console.print("  [dim]  • travado = a LLM escreve a roupa só como o trigger, "
+                      "sem descrever cor/tecido (mais consistente).[/dim]")
+        console.print("  [dim]  • descrito = mantém o trigger mas descreve a roupa "
+                      "normalmente (mais flexível/editável).[/dim]")
+        cfg.outfit_lock = ask_yn("Travar os outfits (só o trigger, sem descrever a roupa)?",
+                                 default=True)
+        success(f"Modo dos outfits: {'travado (só trigger)' if cfg.outfit_lock else 'descrito (roupa descrita)'}")
     else:
         info("Uma pasta única → personagem base (sem perguntas de outfit).")
 

@@ -67,6 +67,8 @@ def build_metadata(cfg: Any, repo_id: str, env: dict, *, model_repo: str,
         "repo_id": repo_id,
         "project_name": getattr(cfg, "project_name", ""),
         "trigger_character": getattr(cfg, "trigger_character", ""),
+        "outfit_mode": ("locked" if getattr(cfg, "outfit_lock", True)
+                        else "described"),
         "triggers": _triggers(cfg),
         "safetensors": final_safetensors,
         "base_model": model_repo,
