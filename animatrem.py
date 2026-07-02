@@ -1605,7 +1605,26 @@ def _summarize_groups(cfg: "TrainingConfig") -> None:
 
 
 SCHED_NUM_REPEATS = 10       # repeat each image 10× per epoch (same all groups)
-SCHED_TARGET_CHECKPOINTS = 10  # ~10 model saves across the run (by steps)
+SCHED_SAVE_DIVISOR = 10      # base: ~1 save per 1/10 of the run, before batch
+
+
+def _micro_batch_size(cfg: "TrainingConfig") -> int:
+    """Effective micro_batch_size_per_gpu (min across resolutions if mixed)."""
+    mb = cfg.micro_batch_size
+    if isinstance(mb, int):
+        return max(1, mb)
+    if mb:
+        return max(1, min(b for _, b in mb))
+    return 1
+
+
+def _save_every_n_steps(total_steps: int, micro_batch: int) -> int:
+    """save_every_n_steps that ACCOUNTS FOR micro_batch: a bigger batch moves
+    more per step, so the sweet spot passes in fewer steps → save more often.
+    Base interval = total_steps // SCHED_SAVE_DIVISOR, then divided by the
+    micro_batch (the "4"). So batch 4 saves 4× more often than batch 1."""
+    base = max(1, total_steps // SCHED_SAVE_DIVISOR)
+    return max(1, base // max(1, micro_batch))
 
 
 def _compute_group_schedule(cfg: "TrainingConfig", recipe: dict,
@@ -1616,12 +1635,9 @@ def _compute_group_schedule(cfg: "TrainingConfig", recipe: dict,
       epochs derived so exposures/image = epochs × num_repeats × n_res hits the
       recipe target (~660, the validated sweet spot);
       total_steps = epochs × (Σ images × num_repeats × n_res) / eff_batch;
-      save the model every  total_steps // SCHED_TARGET_CHECKPOINTS  STEPS
-      (diffusion-pipe's native `save_every_n_steps`, dirs named step<N>/).
-
-    This gives ~SCHED_TARGET_CHECKPOINTS checkpoints to pick the best from,
-    regardless of dataset size, using the engine's own saving — no per-epoch
-    flooding.
+      save_every_n_steps = (total_steps // 10) // micro_batch  — the engine's
+      native `save_every_n_steps` (dirs named step<N>/), made denser for larger
+      batches so a fast-moving run still gets fine-grained checkpoints early.
     """
     n_res = max(1, len(cfg.resolutions))
 
@@ -1638,8 +1654,9 @@ def _compute_group_schedule(cfg: "TrainingConfig", recipe: dict,
     steps_per_epoch = max(1, samples_per_epoch // max(1, eff_batch))
     cfg.total_steps = steps_per_epoch * cfg.epochs
 
-    # Native step-based saving (train.py names these step<N>/).
-    cfg.save_every_n_steps = max(1, cfg.total_steps // SCHED_TARGET_CHECKPOINTS)
+    # Native step-based saving, accounting for micro_batch (the "4").
+    cfg.save_every_n_steps = _save_every_n_steps(cfg.total_steps,
+                                                 _micro_batch_size(cfg))
     cfg.eval_every_n_steps = cfg.save_every_n_steps
     cfg.save_every_n_epochs = 0   # step cadence drives this path
     cfg.eval_every_n_epochs = 0
@@ -2314,7 +2331,7 @@ def phase7_write_tomls(cfg: TrainingConfig) -> None:
             samples_per_epoch = total_image_count(cfg) * max(1, cfg.num_repeats) * n_res
         steps_per_epoch = max(1, samples_per_epoch // eff_batch)
         cfg.total_steps = steps_per_epoch * max(1, cfg.epochs)
-        cfg.save_every_n_steps = max(1, cfg.total_steps // SCHED_TARGET_CHECKPOINTS)
+        cfg.save_every_n_steps = _save_every_n_steps(cfg.total_steps, eff_micro)
         cfg.eval_every_n_steps = cfg.save_every_n_steps
 
     dataset_entries = get_dataset_entries(cfg)
