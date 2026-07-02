@@ -1336,6 +1336,25 @@ def _slugify(name: str) -> str:
     return s or "character"
 
 
+# huggingface.co/<repo>/resolve/<rev>/<path>  (optionally datasets/ or spaces/)
+_HF_FILE_RE = re.compile(
+    r"^https?://huggingface\.co/(?:(?P<dtype>datasets|spaces)/)?"
+    r"(?P<repo>[^/]+/[^/]+)/resolve/(?P<rev>[^/]+)/(?P<path>[^?#]+)"
+)
+
+
+def _parse_hf_file_url(url: str):
+    """Parse an HF `resolve` file URL → (repo_id, repo_type, revision, path).
+    Returns None if it's not an HF file URL."""
+    m = _HF_FILE_RE.match(url)
+    if not m:
+        return None
+    dtype = m.group("dtype")
+    repo_type = {"datasets": "dataset", "spaces": "space"}.get(dtype, "model")
+    from urllib.parse import unquote
+    return m.group("repo"), repo_type, m.group("rev"), unquote(m.group("path"))
+
+
 def _download_raw(source: str, dest_dir: Path) -> Path:
     """Resolve a single input source into a local root dir WITHOUT flattening
     across subfolders (so per-outfit folders survive). Local dirs are copied
@@ -1351,6 +1370,25 @@ def _download_raw(source: str, dest_dir: Path) -> Path:
         return dest_dir
 
     if re.match(r"^https?://", source) or _is_mega_url(source):
+        # HF resolve URL → download with the token (works for private/gated).
+        hf = _parse_hf_file_url(source)
+        if hf is not None:
+            repo_id, repo_type, rev, path_in_repo = hf
+            from huggingface_hub import hf_hub_download
+            token = os.environ.get("HF_TOKEN") or None
+            os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+            info(f"Baixando de HF ({repo_type}): [bold]{escape(repo_id)}[/bold] : {escape(path_in_repo)}")
+            local = Path(hf_hub_download(repo_id=repo_id, filename=path_in_repo,
+                                        revision=rev, repo_type=repo_type,
+                                        token=token))
+            ext = _detect_archive_ext(local.name)
+            if ext:
+                info(f"Extraindo {local.name} ({ext})...")
+                _extract_archive(local, dest_dir)
+                return dest_dir
+            # Not an archive: use the containing dir as the source root.
+            return local.parent
+
         downloaded = _download_url(source, dest_dir / "_dl")
         if downloaded.is_dir():
             return downloaded

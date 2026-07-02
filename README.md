@@ -13,7 +13,7 @@ com defaults travados. Você só responde conteúdo (nome, trigger, link).
 ```bash
 git clone https://github.com/adbrasi/character_animatrem
 cd character_animatrem
-python animatrem.py
+python3 animatrem.py
 ```
 
 Ou, numa GPU nova, o bootstrap:
@@ -92,10 +92,10 @@ triggers, exemplos de caption por outfit, config de treino, uso no ComfyUI) e um
 
 ## Flags / overrides
 
-- `python animatrem.py --advanced` — caminho antigo (receitas/hiperparâmetros
+- `python3 animatrem.py --advanced` — caminho antigo (receitas/hiperparâmetros
   manuais: personagem, estilo, conceito, full finetune; **sem** captioning
   embutido — você fornece os `.txt`).
-- `python animatrem.py --force` — pula o menu de projetos existentes.
+- `python3 animatrem.py --force` — pula o menu de projetos existentes.
 - `.env`:
   - `ANIMATREM_CAPTION_MODEL` (default `google/gemini-2.5-flash`)
   - `ANIMATREM_HF_PRIVATE` (`1` = privado, default)
