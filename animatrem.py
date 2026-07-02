@@ -299,10 +299,11 @@ RECIPES: dict[str, dict] = {
         "eps":          1e-8,
         "loss":         "mse",
         "pseudo_huber_c": None,
-        # lilting v4: ~660 expos/img é o pico de qualidade (sweet spot 600–720).
-        # Adicionamos folga p/ topar 720 — diffusion-pipe salva por epoch e
-        # você escolhe o melhor checkpoint depois.
-        "exposures_per_image": 720,
+        # lilting v4 (53-img kanachan, validated): 600–720 expos/img = sweet
+        # spot; ep150(600)/ep180(720) hit 100% direction accuracy, ep200(800)
+        # collapsed to 0% (ghosting). Target the MIDDLE of the window (660) for
+        # margin below the ~800 cliff; save ~11 checkpoints to cherry-pick.
+        "exposures_per_image": 660,
         "warmup_steps": 100,
         "lr_scheduler": "constant",
         "min_repeats":  1,
@@ -1723,19 +1724,21 @@ def _compute_schedule(cfg: TrainingConfig, recipe: dict, eff_batch: int) -> None
     passes_per_epoch_per_img = cfg.num_repeats * n_res
     cfg.epochs = max(1, target_exposures // max(1, passes_per_epoch_per_img))
 
-    # Save cadence — aim for a HANDFUL of checkpoints to cherry-pick from, NOT
-    # one per epoch. Anima LoRAs are ~140 MB each, so 60 epochs × 1/epoch = ~8 GB
-    # of checkpoints and 60 HF uploads — wasteful and floods small disks / HF
-    # storage quotas. Target ~TARGET_SAVES checkpoints spread across the run.
-    #   - LoRA (rank > 0): every epochs/8 (≈8 saves).
+    # Save cadence — a HANDFUL of checkpoints to cherry-pick from, NOT one per
+    # epoch. Research (lilting Receita C) saves every ~10 epochs on a 150-epoch
+    # run (~15 saves); scaled to our shorter character runs that's ~1 save per
+    # 5 epochs → ~TARGET_SAVES checkpoints. The best epoch is mid-to-late in the
+    # validated window, so you compare the last few.
+    #   - LoRA (rank > 0): ~TARGET_SAVES checkpoints total (~140 MB each).
     #   - FFT (rank == 0): whole 2B model each time (~4 GB) → cap at ~5.
-    TARGET_SAVES = 8
+    TARGET_SAVES = 11
     if cfg.rank > 0:
         cfg.save_every_n_epochs = max(1, round(cfg.epochs / TARGET_SAVES))
     else:
         cfg.save_every_n_epochs = max(1, cfg.epochs // 5)
-    # Eval cadence: tdrussell oficial = 5; cap at 5 regardless of total epochs.
-    cfg.eval_every_n_epochs = max(1, min(5, cfg.epochs // 25))
+    # Sample/eval in lockstep with saves (research: sample_every == save_every)
+    # so each checkpoint has a matching preview, without extra eval overhead.
+    cfg.eval_every_n_epochs = cfg.save_every_n_epochs
 
 
 def _apply_gpu_profile(cfg: TrainingConfig, profile: dict, recipe: dict,
@@ -2262,10 +2265,11 @@ def phase7_write_tomls(cfg: TrainingConfig) -> None:
     header("FASE 7 — Gerando dataset.toml e config.toml")
 
     # Safety clamp (also fixes resumed projects saved with an old 1/epoch
-    # cadence): never emit more than ~12 LoRA checkpoints across the run.
+    # cadence): never emit more than ~14 LoRA checkpoints across the run.
     if cfg.rank > 0 and cfg.epochs > 0:
-        if cfg.epochs // max(1, cfg.save_every_n_epochs) > 12:
-            cfg.save_every_n_epochs = max(1, round(cfg.epochs / 8))
+        if cfg.epochs // max(1, cfg.save_every_n_epochs) > 14:
+            cfg.save_every_n_epochs = max(1, round(cfg.epochs / 11))
+        cfg.eval_every_n_epochs = cfg.save_every_n_epochs
 
     dataset_entries = get_dataset_entries(cfg)
 
