@@ -2758,7 +2758,8 @@ def _ensure_hf_repo(project_name: str) -> tuple[bool, str]:
 
 def _setup_hf(cfg: TrainingConfig) -> tuple[bool, str]:
     """animatrem default: auto-create the HF model repo (no question).
-    Private by default; namespace/visibility overridable via env."""
+    PUBLIC by default (public storage is generous and the LoRA is meant to be
+    used/shared); set ANIMATREM_HF_PRIVATE=1 for a private repo."""
     if not os.environ.get("HF_TOKEN"):
         warn("HF_TOKEN ausente — upload para HuggingFace desativado.")
         return False, ""
@@ -2770,8 +2771,8 @@ def _setup_hf(cfg: TrainingConfig) -> tuple[bool, str]:
         except Exception:
             ns = ""
     repo_id = f"{ns}/{cfg.project_name}" if ns else cfg.project_name
-    private = os.environ.get("ANIMATREM_HF_PRIVATE", "1").lower() not in (
-        "0", "false", "no", "off")
+    private = os.environ.get("ANIMATREM_HF_PRIVATE", "0").lower() in (
+        "1", "true", "yes", "on")
     cfg.hf_private = private
     try:
         from huggingface_hub import HfApi
