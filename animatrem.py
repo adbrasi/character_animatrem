@@ -2062,47 +2062,36 @@ def phase_wizard(cfg: TrainingConfig, env: dict, transformer_path: Path,
         error("Nenhuma imagem encontrada na fonte.")
         sys.exit(1)
 
-    # 4) Per-group outfit questions (only when the input has multiple folders).
+    # 4) Groups from folder structure — NO typing. Multiple subfolders → each is
+    #    an outfit whose TRIGGER is the folder name (described mode, Anima path).
+    #    Single folder → base character. The LLM instruction is auto-built.
     cfg.groups = []
     cfg.dataset_dirs = []
+    cfg.outfit_lock = False  # described mode = the correct Anima path
     multi = len(group_dirs) > 1
     if multi:
         console.print(Rule(style="dim"))
-        info(f"Detectei [bold]{len(group_dirs)}[/bold] pastas — vou perguntar sobre cada outfit.")
-        # Project-level outfit caption mode (asked once). Default = DESCRIBED,
-        # the correct Anima path (describe the clothing + keep the outfit trigger).
-        console.print("  [dim]Modo dos outfits:[/dim]")
-        console.print("  [dim]  • descrito (recomendado) = descreve a roupa "
-                      "normalmente E mantém o trigger do outfit (caminho Anima).[/dim]")
-        console.print("  [dim]  • travado = escreve a roupa só como o trigger, sem "
-                      "descrever (mais rígido; geralmente pior).[/dim]")
-        described = ask_yn("Descrever a roupa junto com o trigger do outfit "
-                           "(caminho Anima, recomendado)?", default=True)
-        cfg.outfit_lock = not described
-        success(f"Modo dos outfits: "
-                f"{'descrito (roupa + trigger)' if described else 'travado (só trigger)'}")
+        info(f"Detectei [bold]{len(group_dirs)}[/bold] subpastas → cada uma é um "
+             f"outfit; o nome da pasta vira o trigger.")
     else:
-        info("Uma pasta única → personagem base (sem perguntas de outfit).")
+        info("Uma pasta única → personagem base (sem outfit).")
 
     for gd in group_dirs:
         n = count_images(gd)
-        g: dict = {
-            "path": str(gd), "image_count": n, "is_outfit": False,
-            "trigger_outfit": "", "custom_instruction": "", "num_repeats": 1,
-            "caption_examples": [],
-        }
         if multi:
-            console.print()
-            console.print(f"  [bold]Pasta '{escape(gd.name)}'[/bold] — {n} imagens")
-            if ask_yn("É um outfit específico?", default=True):
-                g["is_outfit"] = True
-                default_ot = f"{cfg.trigger_character}_{_slugify(gd.name)}"
-                g["trigger_outfit"] = _slugify(
-                    ask("  Nome/trigger do outfit", default_ot, allow_empty=False))
-                console.print("  [dim]Instrução opcional pra LLM sobre este outfit "
-                              "(enter p/ pular). Ex.: 'este personagem só aparece "
-                              "sem camisa ou de palhaço; nunca invente outra roupa'.[/dim]")
-                g["custom_instruction"] = ask("  Instrução", "", allow_empty=True).strip()
+            trig = _slugify(gd.name)
+            instruction = (
+                f"The outfit shown in this set is named \"{trig}\". Include the "
+                f"token \"{trig}\" right before you describe the clothing "
+                f"(e.g. \"{trig}, <clothing details>\"), and keep describing the "
+                f"outfit normally.")
+            g: dict = {"path": str(gd), "image_count": n, "is_outfit": True,
+                       "trigger_outfit": trig, "custom_instruction": instruction,
+                       "num_repeats": 1, "caption_examples": []}
+        else:
+            g = {"path": str(gd), "image_count": n, "is_outfit": False,
+                 "trigger_outfit": "", "custom_instruction": "",
+                 "num_repeats": 1, "caption_examples": []}
         cfg.groups.append(g)
         cfg.dataset_dirs.append(str(gd))
 
