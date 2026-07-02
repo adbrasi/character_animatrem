@@ -1998,6 +1998,7 @@ def phase_wizard(cfg: TrainingConfig, env: dict, transformer_path: Path,
     cfg.trigger_character = _slugify(
         ask("Trigger word do personagem", default_trigger, allow_empty=False))
     success(f"Trigger do personagem: [bold]{cfg.trigger_character}[/bold]")
+    cfg.save()  # persist early so the project is resumable from here on
 
     # 3) Single input source.
     console.print(Rule(style="dim"))
@@ -2069,6 +2070,7 @@ def phase_wizard(cfg: TrainingConfig, env: dict, transformer_path: Path,
     reps = ", ".join(f"{Path(g['path']).name}×{g['num_repeats']}" for g in cfg.groups)
     info(f"Cronograma: epochs={cfg.epochs} · repeats por grupo: {reps} · res={cfg.resolutions}")
 
+    cfg.save()  # persist full wizard result → resume skips all of the above
     return cfg
 
 
@@ -2146,6 +2148,25 @@ def phase5_summary(cfg: TrainingConfig, env: dict, skip_confirm: bool = False) -
 def phase_caption(cfg: TrainingConfig, env: dict) -> None:
     header("CAPTIONING — PixAI booru tags + Gemini Flash (OpenRouter)")
 
+    recaption = "--recaption" in sys.argv
+
+    # Which groups still need captioning? (resume-friendly: skip done groups,
+    # finish partial ones). Only require the API key if there's real work.
+    def _needs_caption(g: dict) -> bool:
+        gd = Path(g["path"])
+        return (recaption or g.get("image_count", 0) <= 0
+                or _count_nonempty_captions(gd) < g["image_count"])
+
+    pending = [g for g in cfg.groups if _needs_caption(g)]
+    if not pending:
+        success("Todos os grupos já legendados — nada a refazer "
+                "(use --recaption para forçar).")
+        for g in cfg.groups:
+            g["caption_examples"] = _sample_captions(Path(g["path"]), 3)
+        cfg.caption_count = total_caption_count(cfg)
+        cfg.save()
+        return
+
     if not os.environ.get("OPENROUTER_API_KEY"):
         warn("OPENROUTER_API_KEY não definido — necessário para a caption LLM.")
         console.print("        [dim]Pegue em https://openrouter.ai/keys[/dim]")
@@ -2156,7 +2177,6 @@ def phase_caption(cfg: TrainingConfig, env: dict) -> None:
         os.environ["OPENROUTER_API_KEY"] = key
 
     info(f"Modelo de caption: [bold]{CAPTION_MODEL}[/bold]  ·  tagger: PixAI")
-    recaption = "--recaption" in sys.argv
     console.print()
 
     for i, g in enumerate(cfg.groups, 1):
@@ -3017,7 +3037,6 @@ def main() -> None:
     transformer_path, vae_path, llm_path = phase3_download_models(env)
 
     reconfigure = getattr(cfg, "_reconfigure", False) if cfg else False
-    need_caption = False
     if cfg is None or reconfigure:
         if cfg is None:
             cfg = TrainingConfig()
@@ -3030,12 +3049,16 @@ def main() -> None:
             cfg = phase4_configure(cfg, env, transformer_path, vae_path, llm_path)
         else:
             cfg = phase_wizard(cfg, env, transformer_path, vae_path, llm_path)
-            need_caption = True
     else:
-        # Resume: model paths refreshed; captions already exist on disk.
+        # Resume: refresh model paths; the saved groups/captions drive the rest.
         cfg.transformer_path = str(transformer_path)
         cfg.vae_path         = str(vae_path)
         cfg.llm_path         = str(llm_path)
+
+    # Caption whenever this is an animatrem project (has groups). phase_caption
+    # skips already-captioned groups, so a resume is cheap and also finishes any
+    # partially-captioned group instead of training on empty .txt.
+    need_caption = (not advanced) and bool(getattr(cfg, "groups", []))
 
     # Caption first (so the summary shows real caption counts), then TOMLs.
     if not skip_to_train and need_caption:
