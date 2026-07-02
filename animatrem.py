@@ -2590,12 +2590,17 @@ def _list_ckpt_dirs(output_dir: Path) -> list[Path]:
     return sorted(dirs, key=lambda d: _ckpt_dir_info(d)[1])  # type: ignore[index]
 
 
-def _make_friendly_safetensors_copy(epoch_dir: Path, project_name: str) -> Optional[Path]:
+def _make_friendly_safetensors_copy(epoch_dir: Path, project_name: str,
+                                    wait: bool = True) -> Optional[Path]:
     """Diffusion-pipe hardcodes `adapter_model.safetensors` (LoRA) and
     `model.safetensors` (FFT) at cosmos_predict2.py:320-324. We can't change
     the canonical name (it's referenced by `latest` tags etc.), but we CAN
     drop a friendly-named hardlink/copy alongside, and keep that one in sync
-    with HF uploads. Returns the friendly path if created/refreshed."""
+    with HF uploads. Returns the friendly path if created/refreshed.
+
+    wait=True polls for size-stability (used by the live watcher while files are
+    still being written); wait=False skips it (post-training, files are done —
+    avoids blocking sleeps that made the final sweep hang)."""
     info = _ckpt_dir_info(epoch_dir)
     if info is None:
         return None
@@ -2606,7 +2611,9 @@ def _make_friendly_safetensors_copy(epoch_dir: Path, project_name: str) -> Optio
         if cand.exists():
             canonical = cand
             break
-    if canonical is None or not _wait_for_stable(canonical):
+    if canonical is None:
+        return None
+    if wait and not _wait_for_stable(canonical):
         return None
     friendly = epoch_dir / f"{project_name}_{tag}.safetensors"
     if friendly.exists() and friendly.stat().st_size == canonical.stat().st_size:
@@ -2645,9 +2652,9 @@ def _rename_watcher(train_proc: subprocess.Popen, output_dir: Path,
                         on_friendly(friendly)
                     except Exception:  # never let the watcher crash
                         pass
-    # Final pass after training ends — catch the very last checkpoint.
+    # Final pass after training ends — files are done, so don't sleep-wait.
     for epoch_dir in _list_ckpt_dirs(output_dir):
-        friendly = _make_friendly_safetensors_copy(epoch_dir, project_name)
+        friendly = _make_friendly_safetensors_copy(epoch_dir, project_name, wait=False)
         if friendly and on_friendly is not None:
             try:
                 on_friendly(friendly)
@@ -2959,12 +2966,12 @@ def phase8_train(cfg: TrainingConfig, hf_upload: bool, repo_id: str
     finally:
         signal.signal(signal.SIGINT, old_handler)
         for t in threads:
-            t.join(timeout=10)
+            t.join(timeout=3)
 
-    if interrupts["n"] > 0:
+    cfg._interrupted = interrupts["n"] > 0  # type: ignore[attr-defined]
+    if cfg._interrupted:
         warn("Treino cancelado pelo usuário. Checkpoints já salvos ficam em outputs/.")
-
-    if train_proc.returncode != 0:
+    elif train_proc.returncode != 0:
         error(f"Treinamento terminou com código {train_proc.returncode}")
 
     return hf_upload, repo_id
@@ -2973,6 +2980,28 @@ def phase8_train(cfg: TrainingConfig, hf_upload: bool, repo_id: str
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 9 — Post-training
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _finalize_after_cancel(cfg: TrainingConfig) -> None:
+    """Fast, local-only wrap-up after the user cancels training: name the
+    already-saved checkpoints nicely and print where they are. No stability
+    sleeps, no HF uploads — nothing that could hang."""
+    header("Cancelado — checkpoints locais")
+    out_dir = Path(cfg.output_dir)
+    dirs = _list_ckpt_dirs(out_dir)
+    if not dirs:
+        warn(f"Nenhum checkpoint salvo ainda em {out_dir}")
+        return
+    friendly: list[Path] = []
+    for d in dirs:
+        f = _make_friendly_safetensors_copy(d, cfg.project_name, wait=False)
+        if f:
+            friendly.append(f)
+    for f in friendly:
+        info(str(f))
+    if friendly:
+        success(f"{len(friendly)} checkpoint(s) em {out_dir}. "
+                f"Rode de novo e escolha 'Continuar' para retomar/subir.")
+
 
 def phase9_post_training(cfg: TrainingConfig, hf_upload: bool, repo_id: str,
                          env: Optional[dict] = None) -> None:
@@ -2992,7 +3021,7 @@ def phase9_post_training(cfg: TrainingConfig, hf_upload: bool, repo_id: str,
         warn("Nenhuma pasta epoch*/step* encontrada.")
         return
     for d in epoch_dirs:
-        _make_friendly_safetensors_copy(d, cfg.project_name)
+        _make_friendly_safetensors_copy(d, cfg.project_name, wait=False)
 
     latest = epoch_dirs[-1]
     success(f"Último checkpoint salvo: {latest}")
@@ -3253,7 +3282,12 @@ def main() -> None:
         hf_upload, repo_id = _setup_hf(cfg)
 
     hf_upload, repo_id = phase8_train(cfg, hf_upload, repo_id)
-    phase9_post_training(cfg, hf_upload, repo_id, env)
+    if getattr(cfg, "_interrupted", False):
+        # User cancelled training — do NOT run the (potentially slow/uploading)
+        # post-processing. Just point at the checkpoints already on disk.
+        _finalize_after_cancel(cfg)
+    else:
+        phase9_post_training(cfg, hf_upload, repo_id, env)
 
 
 if __name__ == "__main__":
