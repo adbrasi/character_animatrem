@@ -957,8 +957,21 @@ def phase2_install_diffusion_pipe(env: dict) -> None:
     if not DIFFUSION_PIPE_DIR.exists():
         info(f"Clonando diffusion-pipe em {DIFFUSION_PIPE_DIR}...")
         DIFFUSION_PIPE_DIR.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", "--recurse-submodules", DIFFUSION_PIPE_REPO,
-             str(DIFFUSION_PIPE_DIR)])
+        # Shallow clone: we only ever *run* this code, never inspect its git
+        # history. The ComfyUI submodule carries a huge history that a normal
+        # clone downloads in full; --depth 1 + --shallow-submodules fetch only
+        # the current snapshot, and -j 8 pulls submodules in parallel. This is
+        # by far the biggest slowdown of the install. Falls back to the full
+        # clone if a server rejects a shallow fetch of a pinned submodule SHA.
+        fast = ["git", "clone", "--depth", "1", "--recurse-submodules",
+                "--shallow-submodules", "-j", "8", DIFFUSION_PIPE_REPO,
+                str(DIFFUSION_PIPE_DIR)]
+        ok = run(fast, check=False).returncode == 0
+        if not ok or not (DIFFUSION_PIPE_DIR / "train.py").exists():
+            warn("Clone raso falhou; refazendo com clone completo (robusto)...")
+            shutil.rmtree(DIFFUSION_PIPE_DIR, ignore_errors=True)
+            run(["git", "clone", "--recurse-submodules", DIFFUSION_PIPE_REPO,
+                 str(DIFFUSION_PIPE_DIR)])
         mark_git_safe(DIFFUSION_PIPE_DIR)
         success(f"Repositório clonado em {DIFFUSION_PIPE_DIR}")
     else:
@@ -1017,7 +1030,8 @@ def phase2b_install_captioner(env: dict) -> None:
     if not CAPTIONER_DIR.exists():
         info(f"Clonando data_araknideo em {CAPTIONER_DIR}...")
         CAPTIONER_DIR.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", CAPTIONER_REPO, str(CAPTIONER_DIR)])
+        # Shallow: no submodules here, we just run it — skip the full history.
+        run(["git", "clone", "--depth", "1", CAPTIONER_REPO, str(CAPTIONER_DIR)])
         mark_git_safe(CAPTIONER_DIR)
         success("Captioner clonado")
     else:
