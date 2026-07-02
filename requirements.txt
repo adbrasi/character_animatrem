@@ -1,0 +1,6 @@
+# Orchestrator-layer deps only. The heavy engine deps (torch, onnxruntime,
+# timm, deepspeed, transformers, etc.) are installed by animatrem.py's
+# bootstrap from the cloned data_araknideo and diffusion-pipe requirements.
+rich>=13.0.0
+requests>=2.31.0
+huggingface_hub[hf-xet]>=0.31.4
