@@ -1,6 +1,6 @@
 {
   "display_name": "anima-character-outfit-described",
-  "description": "Anima character + outfit, modo DESCRITO (flexível): personagem como sujeito, o trigger_outfit aparece como token para seleção, MAS a roupa é descrita normalmente (cor/tecido/corte). Use quando quiser editar/variar a roupa no inference. Aceita instrução custom.",
+  "description": "Anima character + outfit, DESCRIBED mode (the correct Anima path): character as the subject, trigger_outfit included as a selection token, AND the clothing described normally (color/fabric/cut) in the anima-character hybrid tags+prose format. Recommended default. Accepts a custom instruction.",
   "variables": [
     {
       "name": "trigger_character",

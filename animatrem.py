@@ -436,9 +436,10 @@ class TrainingConfig:
     #    num_repeats, caption_examples}
     groups:             list = field(default_factory=list)
     hf_private:         bool = True
-    # Outfit caption mode: True = describe the outfit ONLY as its trigger
-    # (locked/consistent); False = also describe the clothing (flexible).
-    outfit_lock:        bool = True
+    # Outfit caption mode: False (default, the correct Anima path) = describe the
+    # clothing normally AND keep the outfit trigger; True = describe the outfit
+    # ONLY as its trigger (locked — rigid, generally worse).
+    outfit_lock:        bool = False
 
     # Recipe (one of RECIPES keys)
     recipe:             str = "character"
@@ -2068,15 +2069,18 @@ def phase_wizard(cfg: TrainingConfig, env: dict, transformer_path: Path,
     if multi:
         console.print(Rule(style="dim"))
         info(f"Detectei [bold]{len(group_dirs)}[/bold] pastas — vou perguntar sobre cada outfit.")
-        # Project-level outfit caption mode (asked once).
+        # Project-level outfit caption mode (asked once). Default = DESCRIBED,
+        # the correct Anima path (describe the clothing + keep the outfit trigger).
         console.print("  [dim]Modo dos outfits:[/dim]")
-        console.print("  [dim]  • travado = a LLM escreve a roupa só como o trigger, "
-                      "sem descrever cor/tecido (mais consistente).[/dim]")
-        console.print("  [dim]  • descrito = mantém o trigger mas descreve a roupa "
-                      "normalmente (mais flexível/editável).[/dim]")
-        cfg.outfit_lock = ask_yn("Travar os outfits (só o trigger, sem descrever a roupa)?",
-                                 default=True)
-        success(f"Modo dos outfits: {'travado (só trigger)' if cfg.outfit_lock else 'descrito (roupa descrita)'}")
+        console.print("  [dim]  • descrito (recomendado) = descreve a roupa "
+                      "normalmente E mantém o trigger do outfit (caminho Anima).[/dim]")
+        console.print("  [dim]  • travado = escreve a roupa só como o trigger, sem "
+                      "descrever (mais rígido; geralmente pior).[/dim]")
+        described = ask_yn("Descrever a roupa junto com o trigger do outfit "
+                           "(caminho Anima, recomendado)?", default=True)
+        cfg.outfit_lock = not described
+        success(f"Modo dos outfits: "
+                f"{'descrito (roupa + trigger)' if described else 'travado (só trigger)'}")
     else:
         info("Uma pasta única → personagem base (sem perguntas de outfit).")
 

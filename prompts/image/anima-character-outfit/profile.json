@@ -1,6 +1,6 @@
 {
   "display_name": "anima-character-outfit",
-  "description": "Anima character LoRA com outfit específico — trigger_character é o sujeito (no início), e a roupa é escrita APENAS como trigger_outfit, sem descrição visual (cor/tecido/corte). Mantém o formato híbrido tags+prosa do anima-character para pose/cena/luz. Aceita uma instrução custom por dataset.",
+  "description": "Anima character LoRA with a specific outfit (LOCKED) — trigger_character is the subject (at the start), and the outfit is written ONLY as trigger_outfit, with no visual description (color/fabric/cut). Keeps the anima-character hybrid tags+prose format for pose/scene/light. Accepts a per-dataset custom instruction.",
   "variables": [
     {
       "name": "trigger_character",
