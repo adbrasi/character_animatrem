@@ -2791,7 +2791,11 @@ def _hf_monitor(train_proc: subprocess.Popen, output_dir: Path,
         with uploaded_log.open("a") as f:
             f.write(name + "\n")
 
-    pattern = re.compile(rf"^{re.escape(project_name)}_epoch\d+\.safetensors$")
+    # Match BOTH cadences: diffusion-pipe saves `epoch{N}` on epoch cadence and
+    # `step{N}` on step cadence. The character recipe uses save_every_n_steps,
+    # so friendly files are `<project>_stepN.safetensors` — an epoch-only regex
+    # here silently uploaded NOTHING during step-based training.
+    pattern = re.compile(rf"^{re.escape(project_name)}_(epoch|step)\d+\.safetensors$")
 
     while train_proc.poll() is None:
         time.sleep(60)
@@ -3089,10 +3093,14 @@ def phase8_train(cfg: TrainingConfig, hf_upload: bool, repo_id: str
 # Phase 9 — Post-training
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _finalize_after_cancel(cfg: TrainingConfig) -> None:
-    """Fast, local-only wrap-up after the user cancels training: name the
-    already-saved checkpoints nicely and print where they are. No stability
-    sleeps, no HF uploads — nothing that could hang."""
+def _finalize_after_cancel(cfg: TrainingConfig, hf_upload: bool = False,
+                           repo_id: str = "", env: Optional[dict] = None) -> None:
+    """Wrap-up after the user cancels training: name the already-saved
+    checkpoints nicely, print where they are, and OFFER to upload them to HF.
+
+    The upload is opt-in (asked, never automatic) so cancelling can't hang the
+    way it used to. By this point phase8_train has already restored the default
+    SIGINT handler, so a Ctrl+C during the upload just exits cleanly."""
     header("Cancelado — checkpoints locais")
     out_dir = Path(cfg.output_dir)
     dirs = _list_ckpt_dirs(out_dir)
@@ -3106,9 +3114,45 @@ def _finalize_after_cancel(cfg: TrainingConfig) -> None:
             friendly.append(f)
     for f in friendly:
         info(str(f))
-    if friendly:
-        success(f"{len(friendly)} checkpoint(s) em {out_dir}. "
-                f"Rode de novo e escolha 'Continuar' para retomar/subir.")
+    if not friendly:
+        return
+    success(f"{len(friendly)} checkpoint(s) em {out_dir}.")
+
+    # Offer to push to HF. Opt-in → the cancel path never blocks on its own.
+    if not (hf_upload and repo_id) or _HF_UPLOAD_DISABLED:
+        info("Rode de novo e escolha 'Continuar' para retomar/subir depois.")
+        return
+    if not ask_yn(f"Subir os {len(friendly)} checkpoint(s) para {repo_id} agora?",
+                  default=True):
+        info("Ok — ficam locais. 'Continuar' num próximo run também sobe.")
+        return
+
+    # Convenient final copy at project root = the latest (highest-step) file.
+    latest = friendly[-1]
+    final = out_dir / f"{cfg.project_name}.safetensors"
+    try:
+        if final.exists():
+            final.unlink()
+        os.link(latest, final)
+    except OSError:
+        shutil.copy2(latest, final)
+
+    for f in friendly:
+        _hf_upload_file(str(f), f.name, repo_id)
+    _hf_upload_file(str(final), final.name, repo_id)
+    try:
+        from hf_modelcard import write_model_card_files
+        card_path, meta_path = write_model_card_files(
+            cfg, out_dir, repo_id, env or {}, model_repo=MODEL_REPO,
+            transformer_name=Path(cfg.transformer_path).name,
+            caption_model=CAPTION_MODEL, final_safetensors=final.name)
+        _hf_upload_file(str(card_path), "README.md", repo_id)
+        _hf_upload_file(str(meta_path), "animatrem_metadata.json", repo_id)
+        success("Model card + metadata enviados.")
+    except Exception as e:
+        warn(f"Falha ao gerar/enviar model card: {e}")
+    if not _HF_UPLOAD_DISABLED:
+        success(f"Upload concluído → https://huggingface.co/{repo_id}")
 
 
 def phase9_post_training(cfg: TrainingConfig, hf_upload: bool, repo_id: str,
@@ -3391,9 +3435,10 @@ def main() -> None:
 
     hf_upload, repo_id = phase8_train(cfg, hf_upload, repo_id)
     if getattr(cfg, "_interrupted", False):
-        # User cancelled training — do NOT run the (potentially slow/uploading)
-        # post-processing. Just point at the checkpoints already on disk.
-        _finalize_after_cancel(cfg)
+        # User cancelled training — skip the heavy phase9. Name the local
+        # checkpoints and OFFER (opt-in) to upload them, so cancelling never
+        # hangs but you can still push what you have to HF.
+        _finalize_after_cancel(cfg, hf_upload, repo_id, env)
     else:
         phase9_post_training(cfg, hf_upload, repo_id, env)
 
