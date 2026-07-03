@@ -599,6 +599,55 @@ def pip_install(args: list[str], *, check: bool = True) -> subprocess.CompletedP
                 "--progress-bar", "on", *args], check=check)
 
 
+def _importable(module: str) -> bool:
+    """True if `import <module>` succeeds in a fresh subprocess (clean check,
+    no polluting this process' import cache with a half-loaded C-extension)."""
+    return run([sys.executable, "-c", f"import {module}"],
+               check=False, capture_output=True).returncode == 0
+
+
+def ensure_torchaudio() -> None:
+    """Install a torchaudio that matches the ALREADY-installed torch.
+
+    diffusion-pipe's ComfyUI backend imports an LTX audio VAE at load time
+    (comfy/sd.py -> `import torchaudio`), so `import comfy.sd` — which the Anima
+    path does — crashes without torchaudio. It is NOT in requirements.txt and
+    the diffusion-pipe README only installs `torch torchvision`, so RunPod-style
+    images (torch preinstalled, no torchaudio) hit ModuleNotFoundError. We add
+    just torchaudio, matching the existing torch, with --no-deps + --force-
+    reinstall so torch itself is never touched, trying progressively looser
+    sources until `import torchaudio` actually works.
+    """
+    if _importable("torchaudio"):
+        success("torchaudio já disponível")
+        return
+    try:
+        import torch
+    except ImportError:
+        return  # torch block handles the no-torch case; nothing to match yet
+    ver = torch.__version__.split("+")[0]           # e.g. 2.8.0
+    cu = (getattr(torch.version, "cuda", None) or "").replace(".", "")  # 128/130
+    info(f"Instalando torchaudio (requerido pelo backend ComfyUI) p/ torch {ver}...")
+
+    attempts: list[list[str]] = []
+    if cu:
+        stable = f"https://download.pytorch.org/whl/cu{cu}"
+        nightly = f"https://download.pytorch.org/whl/nightly/cu{cu}"
+        attempts.append([f"torchaudio=={ver}", "--index-url", stable])
+        attempts.append(["torchaudio", "--index-url", stable])
+        attempts.append(["torchaudio", "--pre", "--index-url", nightly])
+    attempts.append(["torchaudio"])                 # PyPI default, last resort
+
+    for a in attempts:
+        pip_install([*a, "--no-deps", "--force-reinstall"], check=False)
+        if _importable("torchaudio"):
+            success("torchaudio instalado")
+            return
+    warn("Não consegui instalar um torchaudio compatível com o torch do pod. "
+         "O backend ComfyUI pode falhar ao importar comfy.sd — cheque a versão "
+         "do torch (torch.__version__) e instale o torchaudio correspondente.")
+
+
 def check_cmd(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -1040,6 +1089,10 @@ def phase2_install_diffusion_pipe(env: dict) -> None:
         info(f"Baixando PyTorch (CUDA {cuda_idx[2:]}, ~1 GB) — barra abaixo:")
         pip_install(["torch", "torchvision",
                      "--index-url", f"https://download.pytorch.org/whl/{cuda_idx}"])
+
+    # torchaudio: required by the ComfyUI backend (comfy/sd.py), not by torch
+    # itself and not in requirements.txt — install it to match the torch above.
+    ensure_torchaudio()
 
     # Install diffusion-pipe requirements
     req_file = DIFFUSION_PIPE_DIR / "requirements.txt"
