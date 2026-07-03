@@ -119,11 +119,18 @@ if not WORKSPACE.exists():
 
 DIFFUSION_PIPE_REPO = "https://github.com/tdrussell/diffusion-pipe"
 DIFFUSION_PIPE_DIR = WORKSPACE / "diffusion-pipe"
-# Only submodule Anima's code path actually needs: models/base.py does
-# `sys.path.insert(.../submodules/ComfyUI)` then `import comfy.*`. The other
-# ~8 submodules are backends for other models — never imported for model.type
-# 'anima', so we skip them (they are what made the install take hours).
-DP_SUBMODULES = ["submodules/ComfyUI"]
+# Submodules Anima actually loads — mapped to the package dir that proves the
+# submodule content is present. train.py UNCONDITIONALLY imports utils.patches
+# (-> `import hyvideo.*` + `from comfy...`) and utils.dataset (-> `import
+# comfy...`); the Anima model path (models/base.py) also imports comfy. So
+# ComfyUI + HunyuanVideo are always required. The other ~7 submodules (Cosmos,
+# Lumina_2, flow, HiDream, LTX_Video, OmniGen2, HunyuanImage) are imported only
+# lazily by their own model.type, never for 'anima' — skipping them is what
+# turns a multi-hour install into seconds.
+DP_SUBMODULES = {
+    "submodules/ComfyUI": "comfy",
+    "submodules/HunyuanVideo": "hyvideo",
+}
 
 MODELS_DIR = WORKSPACE / "models" / "anima"
 MODEL_REPO = "circlestone-labs/Anima"
@@ -954,24 +961,29 @@ def phase1_check_environment() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _ensure_dp_submodules() -> None:
-    """Init ONLY the submodules Anima needs (ComfyUI), shallow + parallel.
+    """Init ONLY the submodules Anima needs (ComfyUI + HunyuanVideo), shallow.
 
     A full `submodule update --init --recursive` clones all ~9 vendored model
-    backends with full history — the multi-hour install hang. Anima's import
-    chain reaches only ComfyUI, so we init just that, with `--depth 1` (current
-    snapshot, no history) and `--jobs`. Passing explicit paths makes git touch
-    only those submodules, ignoring the rest even if they were registered by a
-    previous recursive run. Falls back to a full-depth fetch of the same
-    submodule if the server rejects the shallow SHA fetch.
+    backends with full history — the multi-hour install hang. Anima's actual
+    import chain reaches just two (see DP_SUBMODULES), so we init only those,
+    with `--depth 1` (current snapshot, no history) and `--jobs`. Passing
+    explicit paths makes git touch only those submodules, ignoring the rest
+    even if a previous recursive run registered them. Falls back to a full-depth
+    fetch if the server rejects the shallow SHA fetch or content is missing.
     """
+    paths = list(DP_SUBMODULES)
     base = ["git", "-C", str(DIFFUSION_PIPE_DIR), "submodule", "update",
             "--init", "--jobs", "8"]
-    info("Inicializando submódulo necessário (ComfyUI, raso)...")
-    ok = run([*base, "--depth", "1", *DP_SUBMODULES], check=False).returncode == 0
-    comfy_ok = (DIFFUSION_PIPE_DIR / "submodules" / "ComfyUI" / "comfy").is_dir()
-    if not ok or not comfy_ok:
-        warn("Fetch raso do ComfyUI falhou; refazendo submódulo completo...")
-        run([*base, *DP_SUBMODULES], check=False)
+    info("Inicializando submódulos necessários (ComfyUI + HunyuanVideo, rasos)...")
+
+    def _present() -> bool:
+        return all((DIFFUSION_PIPE_DIR / p / pkg).is_dir()
+                   for p, pkg in DP_SUBMODULES.items())
+
+    ok = run([*base, "--depth", "1", *paths], check=False).returncode == 0
+    if not ok or not _present():
+        warn("Fetch raso falhou/incompleto; refazendo submódulos completos...")
+        run([*base, *paths], check=False)
 
 
 def phase2_install_diffusion_pipe(env: dict) -> None:
@@ -995,7 +1007,7 @@ def phase2_install_diffusion_pipe(env: dict) -> None:
     # ~9 model backends as git submodules (HunyuanVideo, Cosmos, Lumina_2,
     # OmniGen2, LTX_Video, HiDream, ...). A recursive clone pulls ALL of them
     # with full history — this is the multi-hour install hang. Anima needs only
-    # ONE of them (ComfyUI), which we init separately below.
+    # two (ComfyUI + HunyuanVideo — see DP_SUBMODULES), init separately below.
     if not DIFFUSION_PIPE_DIR.exists():
         info(f"Clonando diffusion-pipe em {DIFFUSION_PIPE_DIR}...")
         DIFFUSION_PIPE_DIR.parent.mkdir(parents=True, exist_ok=True)
