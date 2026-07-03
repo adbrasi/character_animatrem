@@ -119,6 +119,11 @@ if not WORKSPACE.exists():
 
 DIFFUSION_PIPE_REPO = "https://github.com/tdrussell/diffusion-pipe"
 DIFFUSION_PIPE_DIR = WORKSPACE / "diffusion-pipe"
+# Only submodule Anima's code path actually needs: models/base.py does
+# `sys.path.insert(.../submodules/ComfyUI)` then `import comfy.*`. The other
+# ~8 submodules are backends for other models — never imported for model.type
+# 'anima', so we skip them (they are what made the install take hours).
+DP_SUBMODULES = ["submodules/ComfyUI"]
 
 MODELS_DIR = WORKSPACE / "models" / "anima"
 MODEL_REPO = "circlestone-labs/Anima"
@@ -937,6 +942,27 @@ def phase1_check_environment() -> dict:
 # Phase 2 — Install diffusion-pipe
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _ensure_dp_submodules() -> None:
+    """Init ONLY the submodules Anima needs (ComfyUI), shallow + parallel.
+
+    A full `submodule update --init --recursive` clones all ~9 vendored model
+    backends with full history — the multi-hour install hang. Anima's import
+    chain reaches only ComfyUI, so we init just that, with `--depth 1` (current
+    snapshot, no history) and `--jobs`. Passing explicit paths makes git touch
+    only those submodules, ignoring the rest even if they were registered by a
+    previous recursive run. Falls back to a full-depth fetch of the same
+    submodule if the server rejects the shallow SHA fetch.
+    """
+    base = ["git", "-C", str(DIFFUSION_PIPE_DIR), "submodule", "update",
+            "--init", "--jobs", "8"]
+    info("Inicializando submódulo necessário (ComfyUI, raso)...")
+    ok = run([*base, "--depth", "1", *DP_SUBMODULES], check=False).returncode == 0
+    comfy_ok = (DIFFUSION_PIPE_DIR / "submodules" / "ComfyUI" / "comfy").is_dir()
+    if not ok or not comfy_ok:
+        warn("Fetch raso do ComfyUI falhou; refazendo submódulo completo...")
+        run([*base, *DP_SUBMODULES], check=False)
+
+
 def phase2_install_diffusion_pipe(env: dict) -> None:
     header("FASE 2 — Instalação do diffusion-pipe (tdrussell)")
 
@@ -953,32 +979,26 @@ def phase2_install_diffusion_pipe(env: dict) -> None:
         run([sys.executable, "-m", "pip", "install", "-q",
              "huggingface_hub[hf-xet]>=0.31.4"])
 
-    # Clone diffusion-pipe with submodules
+    # Clone diffusion-pipe.
+    # We clone WITHOUT --recurse-submodules on purpose: diffusion-pipe vendors
+    # ~9 model backends as git submodules (HunyuanVideo, Cosmos, Lumina_2,
+    # OmniGen2, LTX_Video, HiDream, ...). A recursive clone pulls ALL of them
+    # with full history — this is the multi-hour install hang. Anima needs only
+    # ONE of them (ComfyUI), which we init separately below.
     if not DIFFUSION_PIPE_DIR.exists():
         info(f"Clonando diffusion-pipe em {DIFFUSION_PIPE_DIR}...")
         DIFFUSION_PIPE_DIR.parent.mkdir(parents=True, exist_ok=True)
-        # Shallow clone: we only ever *run* this code, never inspect its git
-        # history. The ComfyUI submodule carries a huge history that a normal
-        # clone downloads in full; --depth 1 + --shallow-submodules fetch only
-        # the current snapshot, and -j 8 pulls submodules in parallel. This is
-        # by far the biggest slowdown of the install. Falls back to the full
-        # clone if a server rejects a shallow fetch of a pinned submodule SHA.
-        fast = ["git", "clone", "--depth", "1", "--recurse-submodules",
-                "--shallow-submodules", "-j", "8", DIFFUSION_PIPE_REPO,
-                str(DIFFUSION_PIPE_DIR)]
-        ok = run(fast, check=False).returncode == 0
-        if not ok or not (DIFFUSION_PIPE_DIR / "train.py").exists():
-            warn("Clone raso falhou; refazendo com clone completo (robusto)...")
-            shutil.rmtree(DIFFUSION_PIPE_DIR, ignore_errors=True)
-            run(["git", "clone", "--recurse-submodules", DIFFUSION_PIPE_REPO,
-                 str(DIFFUSION_PIPE_DIR)])
+        # Shallow, no submodules: only ever *run* this code, never its history.
+        run(["git", "clone", "--depth", "1", DIFFUSION_PIPE_REPO,
+             str(DIFFUSION_PIPE_DIR)])
         mark_git_safe(DIFFUSION_PIPE_DIR)
+        _ensure_dp_submodules()
         success(f"Repositório clonado em {DIFFUSION_PIPE_DIR}")
     else:
         mark_git_safe(DIFFUSION_PIPE_DIR)
         info("Atualizando diffusion-pipe...")
         run(["git", "-C", str(DIFFUSION_PIPE_DIR), "pull"], check=False)
-        run(["git", "-C", str(DIFFUSION_PIPE_DIR), "submodule", "update", "--init", "--recursive"], check=False)
+        _ensure_dp_submodules()
         success("diffusion-pipe atualizado")
 
     # PyTorch (Blackwell needs CUDA 12.8+)
