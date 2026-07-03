@@ -3093,6 +3093,30 @@ def phase8_train(cfg: TrainingConfig, hf_upload: bool, repo_id: str
 # Phase 9 — Post-training
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _write_and_upload_info(cfg: TrainingConfig, repo_id: str,
+                           env: Optional[dict], final_name: str,
+                           *, upload: bool = True) -> None:
+    """Generate the dataset-info files (README.md + animatrem_metadata.json +
+    <project>_info.txt) and upload them to HF. These describe triggers, per-
+    folder caption examples and most-frequent tags — everything you need to use
+    the LoRA later. Safe to call BEFORE training (info is dataset-derived, not
+    output-derived) and again after, to refresh with the final weights."""
+    try:
+        from hf_modelcard import write_model_card_files
+        card, meta, info_txt = write_model_card_files(
+            cfg, Path(cfg.output_dir), repo_id, env or {}, model_repo=MODEL_REPO,
+            transformer_name=Path(cfg.transformer_path).name,
+            caption_model=CAPTION_MODEL, final_safetensors=final_name)
+        if upload and repo_id:
+            _hf_upload_file(str(card), "README.md", repo_id)
+            _hf_upload_file(str(meta), "animatrem_metadata.json", repo_id)
+            _hf_upload_file(str(info_txt), info_txt.name, repo_id)
+            if not _HF_UPLOAD_DISABLED:
+                success("Info do dataset (triggers, exemplos, tags) enviada ao HF.")
+    except Exception as e:
+        warn(f"Falha ao gerar/enviar info do dataset: {e}")
+
+
 def _finalize_after_cancel(cfg: TrainingConfig, hf_upload: bool = False,
                            repo_id: str = "", env: Optional[dict] = None) -> None:
     """Wrap-up after the user cancels training: name the already-saved
@@ -3140,17 +3164,7 @@ def _finalize_after_cancel(cfg: TrainingConfig, hf_upload: bool = False,
     for f in friendly:
         _hf_upload_file(str(f), f.name, repo_id)
     _hf_upload_file(str(final), final.name, repo_id)
-    try:
-        from hf_modelcard import write_model_card_files
-        card_path, meta_path = write_model_card_files(
-            cfg, out_dir, repo_id, env or {}, model_repo=MODEL_REPO,
-            transformer_name=Path(cfg.transformer_path).name,
-            caption_model=CAPTION_MODEL, final_safetensors=final.name)
-        _hf_upload_file(str(card_path), "README.md", repo_id)
-        _hf_upload_file(str(meta_path), "animatrem_metadata.json", repo_id)
-        success("Model card + metadata enviados.")
-    except Exception as e:
-        warn(f"Falha ao gerar/enviar model card: {e}")
+    _write_and_upload_info(cfg, repo_id, env, final.name)
     if not _HF_UPLOAD_DISABLED:
         success(f"Upload concluído → https://huggingface.co/{repo_id}")
 
@@ -3209,27 +3223,14 @@ def phase9_post_training(cfg: TrainingConfig, hf_upload: bool, repo_id: str,
 
     if hf_upload and repo_id:
         _hf_upload_file(str(final), final.name, repo_id)
-        # Also try to upload any per-epoch friendly files we may have missed.
+        # Also try to upload any per-checkpoint friendly files we may have missed.
         for d in epoch_dirs:
             for p in d.iterdir():
                 if p.is_file() and friendly_pattern.match(p.name):
                     _hf_upload_file(str(p), p.name, repo_id)
 
-        # Rich model card + machine-readable metadata (animatrem).
-        try:
-            from hf_modelcard import write_model_card_files
-            card_path, meta_path = write_model_card_files(
-                cfg, out_dir, repo_id, env or {},
-                model_repo=MODEL_REPO,
-                transformer_name=Path(cfg.transformer_path).name,
-                caption_model=CAPTION_MODEL,
-                final_safetensors=final.name,
-            )
-            _hf_upload_file(str(card_path), "README.md", repo_id)
-            _hf_upload_file(str(meta_path), "animatrem_metadata.json", repo_id)
-            success("Model card + metadata enviados ao HuggingFace.")
-        except Exception as e:
-            warn(f"Falha ao gerar/enviar model card: {e}")
+        # Rich model card + metadata + plain-text dataset info (animatrem).
+        _write_and_upload_info(cfg, repo_id, env, final.name)
 
     # Inference hint
     triggers = [cfg.trigger_character] + [
@@ -3432,6 +3433,13 @@ def main() -> None:
         hf_upload, repo_id = _ensure_hf_repo(cfg.project_name)
     else:
         hf_upload, repo_id = _setup_hf(cfg)
+
+    # Push the dataset-info files (README, metadata json, <project>_info.txt with
+    # triggers/examples/most-frequent-tags) up front — they're derived from the
+    # captioned dataset, not the training output, so they belong on HF from the
+    # start no matter how training ends. Refreshed again in phase9/cancel.
+    if hf_upload and repo_id:
+        _write_and_upload_info(cfg, repo_id, env, f"{cfg.project_name}.safetensors")
 
     hf_upload, repo_id = phase8_train(cfg, hf_upload, repo_id)
     if getattr(cfg, "_interrupted", False):

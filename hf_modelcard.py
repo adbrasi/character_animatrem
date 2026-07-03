@@ -14,6 +14,8 @@ Written by phase9_post_training:
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -48,19 +50,69 @@ def _triggers(cfg: Any) -> list[dict]:
     return out
 
 
+# ── Tag frequency ───────────────────────────────────────────────────────────
+_TAG_SPLIT = re.compile(r"[,\n]")
+
+
+def _count_tags(folder: Path) -> Counter:
+    """Count comma-separated caption segments across all .txt in `folder`.
+
+    The captions are the training ground truth (booru tags + prose). Splitting
+    on commas and keeping the short, tag-like segments (not full prose
+    sentences) gives a useful 'most frequent tags' signal per dataset."""
+    counter: Counter = Counter()
+    folder = Path(folder)
+    if not folder.exists():
+        return counter
+    for p in sorted(folder.rglob("*.txt")):
+        if p.name.endswith("_info.txt"):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for seg in _TAG_SPLIT.split(text):
+            tag = " ".join(seg.strip().lower().split())
+            if not tag or len(tag) > 40 or len(tag.split()) > 5:
+                continue          # drop prose sentences, keep tag-like tokens
+            if tag.endswith(".") or ":" in tag:
+                continue
+            counter[tag] += 1
+    return counter
+
+
+def _top_list(counter: Counter, n: int) -> list[dict]:
+    return [{"tag": t, "count": c} for t, c in counter.most_common(n)]
+
+
+def _tag_stats(cfg: Any) -> tuple[dict[str, list[dict]], list[dict]]:
+    """Return ({folder_name: top_tags}, overall_top_tags) for all groups."""
+    per_folder: dict[str, list[dict]] = {}
+    overall: Counter = Counter()
+    for g in _groups(cfg):
+        folder = Path(g.get("path", ""))
+        c = _count_tags(folder)
+        overall.update(c)
+        per_folder[folder.name] = _top_list(c, 15)
+    return per_folder, _top_list(overall, 25)
+
+
 def build_metadata(cfg: Any, repo_id: str, env: dict, *, model_repo: str,
                    transformer_name: str, caption_model: str,
                    final_safetensors: str) -> dict:
+    per_folder_tags, overall_tags = _tag_stats(cfg)
     groups_meta = []
     for g in _groups(cfg):
+        folder = Path(g.get("path", "")).name
         groups_meta.append({
-            "folder": Path(g.get("path", "")).name,
+            "folder": folder,
             "is_outfit": bool(g.get("is_outfit")),
             "trigger_outfit": g.get("trigger_outfit", ""),
             "custom_instruction": g.get("custom_instruction", ""),
             "image_count": int(g.get("image_count", 0)),
             "num_repeats": int(g.get("num_repeats", 1)),
             "caption_examples": list(g.get("caption_examples", []))[:3],
+            "top_tags": per_folder_tags.get(folder, []),
         })
     return {
         "tool": "animatrem",
@@ -94,6 +146,7 @@ def build_metadata(cfg: Any, repo_id: str, env: dict, *, model_repo: str,
                 "profile": env.get("gpu_profile", "")},
         "dataset": {"total_images": getattr(cfg, "image_count", 0),
                     "groups": groups_meta},
+        "top_tags": overall_tags,
     }
 
 
@@ -170,23 +223,30 @@ def build_model_card(cfg: Any, repo_id: str, env: dict, *, model_repo: str,
     lines.append("```")
     lines.append("")
 
-    # ── Per-outfit sections with real caption examples ──────────────
+    # ── Per-outfit sections with real caption examples + top tags ───
+    per_folder_tags, overall_tags = _tag_stats(cfg)
     if groups:
         lines.append("## Datasets")
         lines.append("")
         for g in groups:
+            folder = Path(g.get("path", "")).name
             if g.get("is_outfit"):
                 title = f"Outfit `{g['trigger_outfit']}`"
             else:
                 title = f"Character base (`{char}`)"
             lines.append(f"### {title}")
             lines.append("")
-            lines.append(f"- Folder: `{Path(g.get('path','')).name}`  ·  "
+            lines.append(f"- Folder: `{folder}`  ·  "
                          f"Images: **{g.get('image_count', 0)}**  ·  "
                          f"num_repeats: {g.get('num_repeats', 1)}")
             if g.get("custom_instruction"):
                 lines.append(f"- Caption instruction: "
                              f"_{_truncate(g['custom_instruction'], 300)}_")
+            tags = per_folder_tags.get(folder, [])
+            if tags:
+                lines.append("- Most frequent tags: "
+                             + ", ".join(f"`{t['tag']}` ({t['count']})"
+                                         for t in tags[:12]))
             examples = list(g.get("caption_examples", []))[:3]
             if examples:
                 lines.append("- Example captions:")
@@ -196,6 +256,13 @@ def build_model_card(cfg: Any, repo_id: str, env: dict, *, model_repo: str,
                     lines.append("")
             else:
                 lines.append("")
+
+    if overall_tags:
+        lines.append("## Most frequent tags (all datasets)")
+        lines.append("")
+        lines.append(", ".join(f"`{t['tag']}` ({t['count']})"
+                               for t in overall_tags[:25]))
+        lines.append("")
 
     # ── Training config ─────────────────────────────────────────────
     lines.append("## Training")
@@ -231,10 +298,74 @@ def _hf_url(repo_id: str) -> str:
     return f"https://huggingface.co/{repo_id}"
 
 
+def build_info_txt(cfg: Any, repo_id: str, env: dict, *, model_repo: str,
+                   final_safetensors: str) -> str:
+    """Plain-text, at-a-glance summary: triggers, per-folder examples, top tags.
+
+    A no-markdown companion to README.md — easy to `cat` or grep later when you
+    just need the triggers and what the outfits looked like."""
+    project = getattr(cfg, "project_name", "anima-lora")
+    char = getattr(cfg, "trigger_character", "")
+    groups = _groups(cfg)
+    per_folder_tags, overall_tags = _tag_stats(cfg)
+    L: list[str] = []
+
+    L.append(f"{project} — Anima character LoRA")
+    if repo_id:
+        L.append(f"Repo: {_hf_url(repo_id)}")
+    L.append(f"Base: {model_repo}  ·  Engine: tdrussell/diffusion-pipe")
+    L.append(f"Final weights: {final_safetensors}")
+    L.append(f"Outfit mode: {'locked' if getattr(cfg,'outfit_lock',True) else 'described'}")
+    L.append("")
+
+    L.append("TRIGGERS")
+    L.append(f"  {char:<24} (character — put at the START of the prompt)")
+    for g in groups:
+        if g.get("is_outfit") and g.get("trigger_outfit"):
+            L.append(f"  {g['trigger_outfit']:<24} (outfit)")
+    L.append("")
+
+    L.append(f"DATASET — {getattr(cfg, 'image_count', 0)} images total")
+    for g in groups:
+        folder = Path(g.get("path", "")).name
+        kind = "outfit" if g.get("is_outfit") else "character"
+        L.append(f"  [{kind}] {folder}/  —  {g.get('image_count', 0)} imgs · "
+                 f"num_repeats {g.get('num_repeats', 1)}")
+        if g.get("custom_instruction"):
+            L.append(f"      instruction: {_truncate(g['custom_instruction'], 200)}")
+        tags = per_folder_tags.get(folder, [])
+        if tags:
+            L.append("      top tags: " + ", ".join(
+                f"{t['tag']} ({t['count']})" for t in tags[:12]))
+        for ex in list(g.get("caption_examples", []))[:3]:
+            L.append(f"      caption> {_truncate(ex, 400)}")
+        L.append("")
+
+    if overall_tags:
+        L.append("TOP TAGS (all datasets)")
+        L.append("  " + ", ".join(f"{t['tag']} ({t['count']})"
+                                   for t in overall_tags[:25]))
+        L.append("")
+
+    L.append("TRAINING")
+    L.append(f"  recipe {getattr(cfg, 'recipe', 'character')} · "
+             f"rank {getattr(cfg, 'rank', 32)} · "
+             f"lr {getattr(cfg, 'learning_rate', 2e-5)} · "
+             f"optimizer {getattr(cfg, 'optimizer_type', 'adamw_optimi')} · "
+             f"resolutions {getattr(cfg, 'resolutions', [768, 1024])} · "
+             f"epochs {getattr(cfg, 'epochs', 0)}")
+    gpu = env.get("gpu_name", "")
+    if gpu:
+        L.append(f"  GPU {gpu} ({env.get('vram_gb', 0)} GB)")
+    L.append("")
+    L.append("Generated by animatrem — https://github.com/adbrasi/character_animatrem")
+    return "\n".join(L) + "\n"
+
+
 def write_model_card_files(cfg: Any, out_dir: Path, repo_id: str, env: dict, *,
                            model_repo: str, transformer_name: str,
                            caption_model: str, final_safetensors: str
-                           ) -> tuple[Path, Path]:
+                           ) -> tuple[Path, Path, Path]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,10 +377,16 @@ def write_model_card_files(cfg: Any, out_dir: Path, repo_id: str, env: dict, *,
         cfg, repo_id, env, model_repo=model_repo,
         transformer_name=transformer_name, caption_model=caption_model,
         final_safetensors=final_safetensors)
+    info_txt = build_info_txt(
+        cfg, repo_id, env, model_repo=model_repo,
+        final_safetensors=final_safetensors)
 
+    project = getattr(cfg, "project_name", "anima-lora")
     card_path = out_dir / "README.md"
     meta_path = out_dir / "animatrem_metadata.json"
+    info_path = out_dir / f"{project}_info.txt"
     card_path.write_text(_clean(card), encoding="utf-8")
     meta_path.write_text(_clean(json.dumps(meta, indent=2, ensure_ascii=False)),
                          encoding="utf-8")
-    return card_path, meta_path
+    info_path.write_text(_clean(info_txt), encoding="utf-8")
+    return card_path, meta_path, info_path
