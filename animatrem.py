@@ -3040,43 +3040,55 @@ def phase8_train(cfg: TrainingConfig, hf_upload: bool, repo_id: str
         threads.append(hf_thread)
 
     # Robust cancellation. deepspeed runs in its OWN session (start_new_session),
-    # so the terminal's Ctrl+C reaches only this parent — not the child. We must
-    # catch SIGINT here and forward it to the child's process group ourselves:
+    # so the terminal's Ctrl+C reaches only this parent — not the child. We
+    # forward it to the child's process group ourselves:
     #   1st Ctrl+C → SIGTERM the whole group (graceful stop).
-    #   2nd Ctrl+C → SIGKILL the group and hard-exit (guaranteed stop).
-    # Without this, Ctrl+C looked ignored and training kept running.
+    #   2nd Ctrl+C → SIGKILL the group (guaranteed stop).
+    #
+    # CRITICAL: the SIGINT handler does the ABSOLUTE MINIMUM — bump a counter —
+    # and nothing else. All the real work (printing, killing the child) happens
+    # below in the poll loop, in normal context. Doing console.print/os.killpg
+    # *inside* the handler was the bug behind "Ctrl+C works sometimes": if the
+    # signal fired while a background upload thread held the rich console lock,
+    # the handler blocked on that lock and the Ctrl+C was silently swallowed.
     interrupts = {"n": 0}
 
     def _on_sigint(signum, frame):
-        interrupts["n"] += 1
+        interrupts["n"] += 1  # async-signal-safe; react in the loop below
+
+    def _signal_child(sig) -> None:
         try:
-            pgid = os.getpgid(train_proc.pid)
+            os.killpg(os.getpgid(train_proc.pid), sig)  # whole group
         except OSError:
-            pgid = None
-        if interrupts["n"] == 1:
-            console.print("\n[bold dark_orange3]⚠ Cancelando treino (SIGTERM)… "
-                          "Ctrl+C de novo para forçar (SIGKILL).[/bold dark_orange3]")
-            sig = signal.SIGTERM
-        else:
-            console.print("\n[bold red1]✘ Forçando encerramento (SIGKILL).[/bold red1]")
-            sig = signal.SIGKILL
-        if pgid is not None:
             try:
-                os.killpg(pgid, sig)
-            except OSError:
+                train_proc.send_signal(sig)
+            except Exception:
                 pass
-        try:
-            train_proc.send_signal(sig)
-        except Exception:
-            pass
-        if interrupts["n"] >= 2:
-            os._exit(130)
 
     old_handler = signal.signal(signal.SIGINT, _on_sigint)
+    reacted = 0
     try:
-        train_proc.wait()
+        while train_proc.poll() is None:
+            n = interrupts["n"]
+            if n > reacted:
+                reacted = n
+                if n == 1:
+                    console.print("\n[bold dark_orange3]⚠ Cancelando treino "
+                                  "(SIGTERM)… Ctrl+C de novo força (SIGKILL)."
+                                  "[/bold dark_orange3]")
+                    _signal_child(signal.SIGTERM)
+                else:
+                    console.print("\n[bold red1]✘ Forçando encerramento "
+                                  "(SIGKILL).[/bold red1]")
+                    _signal_child(signal.SIGKILL)
+                    break
+            time.sleep(0.2)
     finally:
         signal.signal(signal.SIGINT, old_handler)
+        try:
+            train_proc.wait(timeout=10)  # reap the (killed) child
+        except Exception:
+            pass
         for t in threads:
             t.join(timeout=3)
 
