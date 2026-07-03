@@ -581,6 +581,17 @@ def run_capture(cmd: list[str] | str, **kwargs) -> str:
     return result.stdout.strip()
 
 
+def pip_install(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    """pip install WITHOUT -q, with the live progress bar forced on.
+
+    Heavy downloads (PyTorch is ~1 GB) then show pip's native bar with MB/s and
+    ETA, so the user can tell it's actually downloading and not hung. Output is
+    inherited (not captured), so it streams straight to the terminal.
+    """
+    return run([sys.executable, "-m", "pip", "install",
+                "--progress-bar", "on", *args], check=check)
+
+
 def check_cmd(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -1009,21 +1020,20 @@ def phase2_install_diffusion_pipe(env: dict) -> None:
         if env.get("is_blackwell") and not (torch_cuda or "").startswith(("12.8", "12.9", "13.")):
             warn("Blackwell detectada mas PyTorch sem CUDA ≥12.8.")
             if ask_yn("Reinstalar PyTorch com CUDA 12.8?", default=True):
-                run([sys.executable, "-m", "pip", "install", "-q",
-                     "torch", "torchvision",
-                     "--index-url", "https://download.pytorch.org/whl/cu128"])
+                info("Baixando PyTorch (CUDA 12.8, ~1 GB) — barra abaixo:")
+                pip_install(["torch", "torchvision",
+                             "--index-url", "https://download.pytorch.org/whl/cu128"])
     except ImportError:
-        info("Instalando PyTorch...")
         cuda_idx = "cu128" if env.get("is_blackwell") else "cu124"
-        run([sys.executable, "-m", "pip", "install", "-q",
-             "torch", "torchvision",
-             "--index-url", f"https://download.pytorch.org/whl/{cuda_idx}"])
+        info(f"Baixando PyTorch (CUDA {cuda_idx[2:]}, ~1 GB) — barra abaixo:")
+        pip_install(["torch", "torchvision",
+                     "--index-url", f"https://download.pytorch.org/whl/{cuda_idx}"])
 
     # Install diffusion-pipe requirements
     req_file = DIFFUSION_PIPE_DIR / "requirements.txt"
     if req_file.exists():
         info("Instalando requirements do diffusion-pipe (deepspeed, transformers, etc.)...")
-        run([sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)])
+        pip_install(["-r", str(req_file)])
         success("requirements instalados")
     else:
         warn(f"{req_file} não encontrado — pulei pip install -r")
@@ -1035,9 +1045,8 @@ def phase2_install_diffusion_pipe(env: dict) -> None:
             success("flash-attn já instalado")
         except ImportError:
             if ask_yn("Instalar flash-attn (acelera atenção)?", default=False):
-                info("Instalando flash-attn (pode demorar)...")
-                run([sys.executable, "-m", "pip", "install", "-q", "flash-attn",
-                     "--no-build-isolation"], check=False)
+                info("Instalando flash-attn (compila, pode demorar bastante)...")
+                pip_install(["flash-attn", "--no-build-isolation"], check=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1065,7 +1074,7 @@ def phase2b_install_captioner(env: dict) -> None:
     req = CAPTIONER_DIR / "requirements.txt"
     if req.exists():
         info("Instalando requirements do captioner (timm, pillow, requests, ...)...")
-        run([sys.executable, "-m", "pip", "install", "-q", "-r", str(req)], check=False)
+        pip_install(["-r", str(req)], check=False)
         success("requirements do captioner instalados")
 
     # Copy our custom prompt profile(s) into the captioner's prompts tree.
